@@ -37,7 +37,7 @@ $thalesSiteId = 'kvtnl.sharepoint.com,c1c8a9d4-9d43-433d-9460-8f443afc0525,67821
 $thalesDriveId = 'b!1KnIwUOdPUOUYI9EOvwFJcATgmcB32JEsKBSj2U6jOGlm_IorWP4Srp1K5cz9T1L';
 
 // Tijdsbudget per nightly-run in seconden (de backfill gaat de volgende nacht verder).
-$thalesBudgetSeconds = 2700;
+$thalesBudgetSeconds = 3600;
 
 // Mímir (zelfde als de andere apps). BC-data wordt alleen in nightly opgehaald (max_age 14400).
 $mimirApi = 'mimir_…';

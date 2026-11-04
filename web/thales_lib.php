@@ -10,7 +10,7 @@ const THALES_SITE_ID_DEFAULT = 'kvtnl.sharepoint.com,c1c8a9d4-9d43-433d-9460-8f4
 const THALES_DRIVE_ID_DEFAULT = 'b!1KnIwUOdPUOUYI9EOvwFJcATgmcB32JEsKBSj2U6jOGlm_IorWP4Srp1K5cz9T1L';
 const THALES_REPORT_FOLDER = '101_SERV_REP_EXCEL';
 const THALES_MIMIR_MAX_AGE = 14400;
-const THALES_DEFAULT_BUDGET_SECONDS = 2700;
+const THALES_DEFAULT_BUDGET_SECONDS = 3600;
 
 /**
  * BC-velden, bevestigd door Ariadne (04-11-2026, Mímir-namen, company Koninklijke van Twist).
