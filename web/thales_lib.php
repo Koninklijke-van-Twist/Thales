@@ -144,7 +144,31 @@ CREATE TABLE IF NOT EXISTS usage (
     brand_key TEXT, brand TEXT, type_key TEXT, type TEXT, brand_source TEXT, item_no TEXT, times_used INTEGER, qty_total REAL,
     PRIMARY KEY (brand_key, type_key, item_no));
 SQL);
+    thales_migrate($pdo);
     return $pdo;
+}
+
+/** Retry-kolommen toevoegen op een bestaande database; eerder gecrashte rapporten op de retry-lijst zetten. */
+function thales_migrate(PDO $pdo): void
+{
+    $columns = array_column($pdo->query('PRAGMA table_info(reports)')->fetchAll(), 'name');
+    if (in_array('retry_count', $columns, true)) {
+        return;
+    }
+    $pdo->exec('ALTER TABLE reports ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0');
+    $pdo->exec('ALTER TABLE reports ADD COLUMN first_failed_at TEXT');
+    $pdo->exec('ALTER TABLE reports ADD COLUMN last_error TEXT');
+    $pdo->prepare("UPDATE reports SET parse_status = 'retry', retry_count = 1, first_failed_at = ?, last_error = COALESCE(parse_note, 'crash')
+        WHERE parse_status = 'processing' OR (parse_status = 'error' AND (parse_note LIKE 'Vorige run crashte%' OR parse_note LIKE 'FATAAL%'))")
+        ->execute([gmdate('c')]);
+}
+
+/** Rapport na een harde crash of fatale fout op de retry-lijst zetten (na een week: given_up). */
+function thales_mark_retry(string $itemId, string $error): void
+{
+    thales_db()->prepare("UPDATE reports SET parse_status = 'retry', retry_count = retry_count + 1,
+        first_failed_at = COALESCE(first_failed_at, :now), last_error = :error, parse_note = :error, processed_at = :now WHERE item_id = :id")
+        ->execute([':now' => gmdate('c'), ':error' => substr($error, 0, 500), ':id' => $itemId]);
 }
 
 function thales_state(string $key, ?string $default = null): ?string
@@ -169,7 +193,7 @@ function thales_log(string $message): void
     @file_put_contents(thales_data_dir() . '/nightly.log', date('Y-m-d H:i:s') . ' ' . $message . "\n", FILE_APPEND);
 }
 
-/** Fatale fout (geheugen, tijdslimiet) loggen, tonen en het huidige rapport als fout markeren. */
+/** Fatale fout (geheugen, tijdslimiet) loggen, tonen en het huidige rapport op de retry-lijst zetten. */
 function thales_fatal_guard(): void
 {
     $e = error_get_last();
@@ -181,8 +205,7 @@ function thales_fatal_guard(): void
     thales_progress($msg);
     try {
         if ($row) {
-            thales_db()->prepare("UPDATE reports SET parse_status = 'error', parse_note = ?, processed_at = ? WHERE item_id = ?")
-                ->execute([substr($msg, 0, 500), gmdate('c'), (string) $row['item_id']]);
+            thales_mark_retry((string) $row['item_id'], $msg);
         }
         thales_set_state('last_run', (string) json_encode(['at' => gmdate('c'), 'status' => 'error', 'message' => substr($msg, 0, 300)]));
     } catch (Throwable) {
@@ -357,7 +380,7 @@ VALUES(:id, :name, :url, :folder, :eq, :date, :wo, :codes, :size, :created, :mod
 ON CONFLICT(item_id) DO UPDATE SET name = excluded.name, web_url = excluded.web_url, folder_name = excluded.folder_name,
     equipment_no = excluded.equipment_no, report_date = excluded.report_date, wo = excluded.wo, task_codes = excluded.task_codes,
     size = excluded.size, created = excluded.created, modified = excluded.modified,
-    parse_status = CASE WHEN :pending = 1 THEN 'pending' ELSE reports.parse_status END
+    parse_status = CASE WHEN reports.parse_status = 'given_up' THEN 'given_up' WHEN :pending = 1 THEN 'pending' ELSE reports.parse_status END
 SQL)->execute([
         ':id' => $id, ':name' => $name, ':url' => (string) ($item['webUrl'] ?? ''),
         ':folder' => $equipmentFolder['name'] ?? '', ':eq' => $meta['equipment_no'] ?? strtok((string) ($equipmentFolder['name'] ?? ''), '_'),
@@ -439,10 +462,16 @@ function thales_sync_delta(float $deadline): bool
 function thales_process_pending(float $deadline, array &$counts): bool
 {
     $db = thales_db();
-    // Rapport waarop een vorige run is gecrasht (geheugen/timeout): als fout markeren, niet opnieuw proberen.
-    $db->prepare("UPDATE reports SET parse_status = 'error', parse_note = 'Vorige run crashte op dit rapport', processed_at = ? WHERE parse_status = 'processing'")
-        ->execute([gmdate('c')]);
-    $select = $db->query("SELECT item_id, name, size FROM reports WHERE parse_status = 'pending' ORDER BY size ASC, modified DESC");
+    // Rapport waarop een vorige run hard is gecrasht (segfault/kill): op de retry-lijst.
+    foreach ($db->query("SELECT item_id FROM reports WHERE parse_status = 'processing'")->fetchAll(PDO::FETCH_COLUMN) as $crashed) {
+        thales_mark_retry((string) $crashed, 'Vorige run crashte op dit rapport');
+    }
+    // Een week lang mislukt: voor altijd overslaan.
+    $db->prepare("UPDATE reports SET parse_status = 'given_up' WHERE parse_status = 'retry' AND first_failed_at <= ?")
+        ->execute([gmdate('c', time() - 7 * 86400)]);
+    // Gewone wachtrij (klein naar groot) eerst, retries daarna.
+    $select = $db->query("SELECT item_id, name, size FROM reports WHERE parse_status IN ('pending', 'retry')
+        ORDER BY parse_status = 'retry', CASE WHEN parse_status = 'retry' THEN first_failed_at END, size ASC, modified DESC");
     $todo = $select->fetchAll();
     thales_progress('Te verwerken rapporten: ' . count($todo));
     $done = 0;
@@ -464,6 +493,7 @@ function thales_process_pending(float $deadline, array &$counts): bool
                 $counts['skipped']++;
                 continue;
             }
+            thales_log('Rapport: ' . $row['name'] . ' (' . (int) $row['size'] . ' bytes)');
             $tmp = tempnam(sys_get_temp_dir(), 'thales');
             [$code] = thales_http('GET', 'https://graph.microsoft.com/v1.0/drives/' . rawurlencode(thales_drive_id()) . '/items/' . rawurlencode($id) . '/content',
                 ['Authorization: Bearer ' . thales_graph_token()], null, $tmp);
@@ -504,7 +534,7 @@ function thales_store_result(string $itemId, array $result): void
     foreach ($result['parts'] as $i => $p) {
         $insP->execute([$itemId, $i + 1, $p['item_no'], $p['description_raw'], $p['qty'], $p['unit']]);
     }
-    $db->prepare('UPDATE reports SET parse_status = ?, parse_note = ?, sheet = ?, processed_at = ? WHERE item_id = ?')
+    $db->prepare('UPDATE reports SET parse_status = ?, parse_note = ?, sheet = ?, processed_at = ?, retry_count = 0, first_failed_at = NULL, last_error = NULL WHERE item_id = ?')
         ->execute([$result['status'], $result['reason'], $result['sheet'], gmdate('c'), $itemId]);
     $db->commit();
 }

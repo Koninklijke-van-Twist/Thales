@@ -149,6 +149,21 @@ $deltaPages = [['value' => [$file('A', '90000001_20260101_WO2600001_10H_CO_1.xls
 thales_nightly(60);
 check((int) thales_parts('PERKINS', '4016TAG2A')[0]['times_used'] === 1 && (float) thales_parts('PERKINS', '4016TAG2A')[0]['qty_total'] === 4.0, 'herverwerking telt niet dubbel');
 
+// Crashbeveiliging: 'processing' bij de start => retry, na de gewone wachtrij opnieuw geprobeerd
+$db = thales_db();
+$db->exec("UPDATE reports SET parse_status = 'processing' WHERE item_id = 'A'");
+$deltaPages = [['value' => [], '@odata.deltaLink' => 'https://g/delta?token=3']];
+thales_nightly(60);
+$a = $db->query("SELECT parse_status, retry_count, first_failed_at FROM reports WHERE item_id = 'A'")->fetch();
+check($a['parse_status'] === 'ok' && (int) $a['retry_count'] === 0 && $a['first_failed_at'] === null, 'gecrasht rapport via retry-lijst opnieuw verwerkt');
+check(str_contains((string) file_get_contents($GLOBALS['THALES_DATA_DIR'] . '/nightly.log'), 'Rapport: 90000001_20260101_WO2600001_10H_CO_1.xlsx (10 bytes)'), 'naam en grootte gelogd voor download');
+// Een week lang mislukt => given_up, ook een nieuwe wijzigingsdatum zet hem niet terug
+$db->prepare("UPDATE reports SET parse_status = 'retry', retry_count = 3, first_failed_at = ? WHERE item_id = 'A'")->execute([gmdate('c', time() - 8 * 86400)]);
+$deltaPages = [['value' => [$file('A', '90000001_20260101_WO2600001_10H_CO_1.xlsx', 'F2', gmdate('Y-m-d\TH:i:s\Z'))], '@odata.deltaLink' => 'https://g/delta?token=4']];
+thales_nightly(60);
+check($db->query("SELECT parse_status FROM reports WHERE item_id = 'A'")->fetchColumn() === 'given_up', 'na een week: given_up, ook na nieuwe wijziging');
+check((thales_status()['counts']['given_up'] ?? 0) === 1, 'status telt given_up');
+
 // Budget op: hervatbaar
 $deltaPages = [['value' => [], '@odata.nextLink' => 'https://g/delta?page=x']];
 $s2 = thales_nightly(0);
