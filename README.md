@@ -40,5 +40,5 @@ Pagina's lezen alleen de eigen SQLite-cache (`web/data/`, door de app afgescherm
    of `Grant-PnPAzureADAppSitePermission -AppId <client-id> -DisplayName Thales -Site <site-url> -Permissions Read`.
 3. **auth.php** op de server: kopie van `auth_TEMPLATE.php` met tenant, client-id, secret, Mímir-URL/sleutels en gebruikers. Niet in git.
 4. **GitHub-secret** `FTP_REMOTE_DIR` zetten (overige FTP-secrets zoals bij Elpis).
-5. **Cron** op de server: `curl -s http://localhost/thales/nightly.php` elke nacht (de eerste nachten vult de backfill zich in delen van `thalesBudgetSeconds`).
+5. **Nachtrun**: niets in te plannen. Een bestaand serverscript vindt `nightly.php` automatisch en roept die elke nacht aan met een gewone GET vanaf localhost (de backfill vult zich de eerste nachten in delen van `thalesBudgetSeconds`).
 6. **Thumbnail**: `web/thumbnail.png` staat op master (van Tim).

@@ -1,0 +1,15 @@
+---
+description: Vaste SQLite-structuur en HTTP-gebruik voor Thales analytics; nooit afwijken.
+globs: web/analytics/**
+alwaysApply: false
+---
+
+# Analytics
+
+De enige bron van waarheid is `web/analytics/rules.md`.
+
+Daar mag onder geen voorwaarde van worden afgeweken.
+
+- Schema: `visits (id INTEGER PK, visited_at INTEGER unix, user_email TEXT)`.
+- Andere implementaties wijzigen `analytics.php` niet en includen het niet.
+- Aanroepen via HTTP na geslaagde toegangcheck in `logincheck.php`, met `user_email`, `api_key` en `oid` uit login-userdata.
