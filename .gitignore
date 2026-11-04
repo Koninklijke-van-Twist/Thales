@@ -1,0 +1,10 @@
+web/auth.php
+
+web/cache/
+web/data/
+
+web/analytics/analytics.sqlite
+web/analytics/analytics.sqlite-*
+web/analytics/.htaccess
+
+data/
