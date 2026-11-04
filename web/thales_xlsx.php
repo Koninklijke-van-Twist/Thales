@@ -55,57 +55,70 @@ final class ThalesXlsx
     public function rows(string $sheet, int $maxRow = 200): array
     {
         $path = $this->sheets[$sheet] ?? null;
-        if ($path === null) {
+        $reader = $path !== null ? $this->reader($path) : null;
+        if ($reader === null) {
             return [];
         }
-        $stream = $this->zip->getStream($path);
-        if ($stream === false) {
-            return [];
-        }
-        fclose($stream);
-        $reader = new XMLReader();
-        if (!$reader->open('zip://' . $this->zip->filename . '#' . $path)) {
-            return [];
-        }
+        // Geen zip://-wrapper en geen expand()/DOM: die gaven segfaults onder mod_php.
         $rows = [];
-        $strings = null;
+        $col = null;
+        $row = 0;
+        $type = '';
+        $value = '';
+        $inText = false;
         while ($reader->read()) {
-            if ($reader->nodeType !== XMLReader::ELEMENT || $reader->localName !== 'c') {
-                continue;
-            }
-            $ref = (string) $reader->getAttribute('r');
-            if (!preg_match('/^([A-Z]+)(\d+)$/', $ref, $m)) {
-                continue;
-            }
-            $row = (int) $m[2];
-            if ($row > $maxRow) {
-                break;
-            }
-            $type = (string) $reader->getAttribute('t');
-            $node = $reader->expand();
-            if (!$node instanceof DOMElement) {
-                continue;
-            }
-            $value = '';
-            if ($type === 'inlineStr') {
-                $value = $node->textContent;
-            } else {
-                foreach ($node->childNodes as $child) {
-                    if ($child instanceof DOMElement && $child->localName === 'v') {
-                        $value = $child->textContent;
+            $node = $reader->nodeType;
+            if ($node === XMLReader::ELEMENT) {
+                $name = $reader->localName;
+                if ($name === 'c') {
+                    $col = null;
+                    if (!preg_match('/^([A-Z]+)(\d+)$/', (string) $reader->getAttribute('r'), $m)) {
+                        continue;
+                    }
+                    $row = (int) $m[2];
+                    if ($row > $maxRow) {
+                        break;
+                    }
+                    $type = (string) $reader->getAttribute('t');
+                    $value = '';
+                    $col = $reader->isEmptyElement ? null : $m[1];
+                } elseif ($col !== null && $name === ($type === 'inlineStr' ? 't' : 'v')) {
+                    if ($name === 'v') {
+                        $value = '';
+                    }
+                    $inText = !$reader->isEmptyElement;
+                }
+            } elseif ($inText && ($node === XMLReader::TEXT || $node === XMLReader::CDATA || $node === XMLReader::SIGNIFICANT_WHITESPACE)) {
+                $value .= $reader->value;
+            } elseif ($node === XMLReader::END_ELEMENT) {
+                if ($reader->localName !== 'c') {
+                    $inText = false;
+                    continue;
+                }
+                if ($col !== null) {
+                    if ($type === 's' && $value !== '') {
+                        $value = $this->sharedStrings()[(int) $value] ?? '';
+                    }
+                    if (trim($value) !== '') {
+                        $rows[$row][$col] = $value;
                     }
                 }
-                if ($type === 's' && $value !== '') {
-                    $strings ??= $this->sharedStrings();
-                    $value = $strings[(int) $value] ?? '';
-                }
-            }
-            if (trim($value) !== '') {
-                $rows[$row][$m[1]] = $value;
+                $col = null;
             }
         }
         $reader->close();
         return $rows;
+    }
+
+    /** XML uit de zip in het geheugen lezen (getFromName) en XMLReader daarop zetten. */
+    private function reader(string $path): ?XMLReader
+    {
+        $xml = $this->zip->getFromName($path);
+        if (!is_string($xml) || $xml === '') {
+            return null;
+        }
+        $reader = new XMLReader();
+        return $reader->XML($xml, null, LIBXML_NONET | LIBXML_COMPACT) ? $reader : null;
     }
 
     /** @return list<string> */
@@ -115,31 +128,38 @@ final class ThalesXlsx
             return $this->strings;
         }
         $this->strings = [];
-        $reader = new XMLReader();
-        if ($this->zip->locateName('xl/sharedStrings.xml') === false
-            || !$reader->open('zip://' . $this->zip->filename . '#xl/sharedStrings.xml')) {
+        $reader = $this->reader('xl/sharedStrings.xml');
+        if ($reader === null) {
             return $this->strings;
         }
-        $ok = $reader->read();
-        while ($ok) {
-            if ($reader->nodeType !== XMLReader::ELEMENT || $reader->localName !== 'si') {
-                $ok = $reader->read();
-                continue;
-            }
-            {
-                $node = $reader->expand();
-                $text = '';
-                if ($node instanceof DOMElement) {
-                    foreach ($node->getElementsByTagName('t') as $t) {
-                        // fonetische hulptekst (rPh) overslaan
-                        if ($t->parentNode instanceof DOMElement && $t->parentNode->localName === 'rPh') {
-                            continue;
-                        }
-                        $text .= $t->textContent;
+        $text = null;
+        $inText = false;
+        $phonetic = 0;
+        while ($reader->read()) {
+            $node = $reader->nodeType;
+            $name = $reader->localName;
+            if ($node === XMLReader::ELEMENT) {
+                if ($name === 'si') {
+                    $text = $reader->isEmptyElement ? null : '';
+                    if ($text === null) {
+                        $this->strings[] = '';
                     }
+                } elseif ($name === 'rPh' && !$reader->isEmptyElement) {
+                    $phonetic++; // fonetische hulptekst overslaan
+                } elseif ($name === 't' && $text !== null && $phonetic === 0) {
+                    $inText = !$reader->isEmptyElement;
                 }
-                $this->strings[] = $text;
-                $ok = $reader->next();
+            } elseif ($inText && ($node === XMLReader::TEXT || $node === XMLReader::CDATA || $node === XMLReader::SIGNIFICANT_WHITESPACE)) {
+                $text .= $reader->value;
+            } elseif ($node === XMLReader::END_ELEMENT) {
+                if ($name === 't') {
+                    $inText = false;
+                } elseif ($name === 'rPh') {
+                    $phonetic = max(0, $phonetic - 1);
+                } elseif ($name === 'si' && $text !== null) {
+                    $this->strings[] = $text;
+                    $text = null;
+                }
             }
         }
         $reader->close();

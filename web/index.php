@@ -32,7 +32,8 @@ $c = $status['counts'];
 $statusLine = LOC('status.line',
     $run ? (new DateTimeImmutable((string) $run['at']))->setTimezone(new DateTimeZone('Europe/Amsterdam'))->format('d-m-Y H:i') : LOC('status.never'),
     (string) ($run['status'] ?? '–'), $status['day_index'] ?? '–',
-    (int) ($c['ok'] ?? 0), (int) ($c['skipped'] ?? 0), (int) ($c['error'] ?? 0), (int) ($c['pending'] ?? 0));
+    (int) ($c['ok'] ?? 0), (int) ($c['skipped'] ?? 0), (int) ($c['error'] ?? 0), (int) ($c['pending'] ?? 0),
+    (int) ($c['retry'] ?? 0), (int) ($c['given_up'] ?? 0));
 
 $brandKey = (string) ($_GET['brand'] ?? '');
 $typeKey = (string) ($_GET['type'] ?? '');
