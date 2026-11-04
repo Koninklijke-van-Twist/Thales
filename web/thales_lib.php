@@ -169,6 +169,26 @@ function thales_log(string $message): void
     @file_put_contents(thales_data_dir() . '/nightly.log', date('Y-m-d H:i:s') . ' ' . $message . "\n", FILE_APPEND);
 }
 
+/** Fatale fout (geheugen, tijdslimiet) loggen, tonen en het huidige rapport als fout markeren. */
+function thales_fatal_guard(): void
+{
+    $e = error_get_last();
+    if ($e === null || !in_array($e['type'], [E_ERROR, E_CORE_ERROR, E_COMPILE_ERROR, E_USER_ERROR], true)) {
+        return;
+    }
+    $row = $GLOBALS['THALES_CURRENT'] ?? null;
+    $msg = 'FATAAL' . ($row ? ' bij ' . $row['name'] . ' (' . round(((int) $row['size']) / 1048576, 1) . ' MB)' : '') . ': ' . $e['message'];
+    thales_progress($msg);
+    try {
+        if ($row) {
+            thales_db()->prepare("UPDATE reports SET parse_status = 'error', parse_note = ?, processed_at = ? WHERE item_id = ?")
+                ->execute([substr($msg, 0, 500), gmdate('c'), (string) $row['item_id']]);
+        }
+        thales_set_state('last_run', (string) json_encode(['at' => gmdate('c'), 'status' => 'error', 'message' => substr($msg, 0, 300)]));
+    } catch (Throwable) {
+    }
+}
+
 /** Voortgangsregel naar de browser/het serverscript (houdt de verbinding open) en naar nightly.log. */
 function thales_progress(string $message): void
 {
@@ -419,6 +439,9 @@ function thales_sync_delta(float $deadline): bool
 function thales_process_pending(float $deadline, array &$counts): bool
 {
     $db = thales_db();
+    // Rapport waarop een vorige run is gecrasht (geheugen/timeout): als fout markeren, niet opnieuw proberen.
+    $db->prepare("UPDATE reports SET parse_status = 'error', parse_note = 'Vorige run crashte op dit rapport', processed_at = ? WHERE parse_status = 'processing'")
+        ->execute([gmdate('c')]);
     $select = $db->query("SELECT item_id, name, size FROM reports WHERE parse_status = 'pending' ORDER BY modified DESC");
     $todo = $select->fetchAll();
     thales_progress('Te verwerken rapporten: ' . count($todo));
@@ -432,6 +455,8 @@ function thales_process_pending(float $deadline, array &$counts): bool
         }
         $id = (string) $row['item_id'];
         $tmp = null;
+        $GLOBALS['THALES_CURRENT'] = $row;
+        $db->prepare("UPDATE reports SET parse_status = 'processing' WHERE item_id = ?")->execute([$id]);
         try {
             $meta = thales_parse_filename((string) $row['name']);
             if ($meta === null || !thales_task_codes_included($meta['task_codes'])) {
@@ -457,6 +482,7 @@ function thales_process_pending(float $deadline, array &$counts): bool
             if ($tmp !== null) {
                 @unlink($tmp);
             }
+            unset($GLOBALS['THALES_CURRENT']);
         }
     }
     return true;
