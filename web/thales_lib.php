@@ -169,6 +169,16 @@ function thales_log(string $message): void
     @file_put_contents(thales_data_dir() . '/nightly.log', date('Y-m-d H:i:s') . ' ' . $message . "\n", FILE_APPEND);
 }
 
+/** Voortgangsregel naar de browser/het serverscript (houdt de verbinding open) en naar nightly.log. */
+function thales_progress(string $message): void
+{
+    thales_log($message);
+    if (PHP_SAPI !== 'cli' && empty($GLOBALS['THALES_QUIET'])) {
+        echo date('H:i:s') . ' ' . $message . "\n";
+        @flush();
+    }
+}
+
 /* ---------------------------------------------------------------- http */
 
 /**
@@ -387,6 +397,10 @@ function thales_sync_delta(float $deadline): bool
         foreach ((array) ($page['value'] ?? []) as $item) {
             thales_apply_delta_item((array) $item, $boundary);
         }
+        $pages = ($pages ?? 0) + 1;
+        if ($pages % 10 === 0) {
+            thales_progress('SharePoint-delta: ' . $pages . ' pagina\'s gelezen');
+        }
         if (isset($page['@odata.nextLink'])) {
             $url = (string) $page['@odata.nextLink'];
             thales_set_state('delta_next', $url);
@@ -407,7 +421,12 @@ function thales_process_pending(float $deadline, array &$counts): bool
     $db = thales_db();
     $select = $db->query("SELECT item_id, name, size FROM reports WHERE parse_status = 'pending' ORDER BY modified DESC");
     $todo = $select->fetchAll();
+    thales_progress('Te verwerken rapporten: ' . count($todo));
+    $done = 0;
     foreach ($todo as $row) {
+        if (++$done % 25 === 0) {
+            thales_progress('Rapporten: ' . $done . '/' . count($todo));
+        }
         if (microtime(true) >= $deadline) {
             return false;
         }
@@ -695,9 +714,12 @@ function thales_nightly(?int $budgetSeconds = null): array
     $today = (new DateTimeImmutable('now', new DateTimeZone('Europe/Amsterdam')))->format('Y-m-d');
     $summary = ['status' => 'partial', 'ok' => 0, 'skipped' => 0, 'error' => 0];
     try {
+        thales_progress('Start nightly');
         $deltaDone = thales_sync_delta($deadline);
+        thales_progress('SharePoint-delta ' . ($deltaDone ? 'compleet' : 'nog niet compleet (gaat volgende run verder)'));
         $pendingDone = thales_process_pending($deadline, $summary);
         foreach (['components', 'items'] as $key) {
+            thales_progress('BC-cache bijwerken: ' . $key);
             try {
                 $summary[$key] = $key === 'items' ? thales_sync_items() : thales_sync_components();
             } catch (Throwable $e) {
