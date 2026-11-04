@@ -442,7 +442,7 @@ function thales_process_pending(float $deadline, array &$counts): bool
     // Rapport waarop een vorige run is gecrasht (geheugen/timeout): als fout markeren, niet opnieuw proberen.
     $db->prepare("UPDATE reports SET parse_status = 'error', parse_note = 'Vorige run crashte op dit rapport', processed_at = ? WHERE parse_status = 'processing'")
         ->execute([gmdate('c')]);
-    $select = $db->query("SELECT item_id, name, size FROM reports WHERE parse_status = 'pending' ORDER BY modified DESC");
+    $select = $db->query("SELECT item_id, name, size FROM reports WHERE parse_status = 'pending' ORDER BY size ASC, modified DESC");
     $todo = $select->fetchAll();
     thales_progress('Te verwerken rapporten: ' . count($todo));
     $done = 0;
