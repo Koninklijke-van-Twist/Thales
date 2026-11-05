@@ -47,7 +47,7 @@ const THALES_BC_WORKORDER_DEFAULT = [
     'min_date' => '2002-01-01',    // ondergrens backfill
     'delta_days' => 31,
 ];
-/** Onder dit aantal taken (motortype+taakcode) val kansberekening terug op taakcode over alle motoren. */
+/** Onder dit aantal taken (motortype+taakcode) toont de UI een lage-zekerheid-melding; kansen blijven wel op dit motortype. */
 const THALES_TASK_ODDS_MIN_TASKS = 3;
 /** Mímir accepteert max. top 10000; top 0 loopt vast. Deel groter dan dit wordt verder opgesplitst. */
 const THALES_MIMIR_CHUNK = 5000;
@@ -1238,58 +1238,33 @@ function thales_median(array $values): float
 }
 
 /**
- * Kans per artikel voor taakcode (+ optioneel motor). Fallback naar alleen taakcode als motor+taak te dun is.
+ * Kans per artikel voor taakcode + motortype. Geen terugval naar andere motoren (compatibiliteit).
+ * level: motor+task (≥ MIN), low (1..MIN-1), none (0 of geen motor).
  * @return array{level:string,tasks:int,parts:list<array{item_no:string,description:string,odds:float,times:int,qty_median:float,hue:int}>}
  */
 function thales_task_odds(string $taskCode, string $brandKey = '', string $typeKey = ''): array
 {
     $code = strtoupper(trim($taskCode));
-    if ($code === '') {
+    if ($code === '' || $brandKey === '' || $typeKey === '') {
         return ['level' => 'none', 'tasks' => 0, 'parts' => []];
     }
     $db = thales_db();
     $vis = thales_sql_item_visible('i', 'tp.item_no');
-    $useMotor = $brandKey !== '' && $typeKey !== '';
-    $scope = static function (bool $motor) use ($db, $code, $brandKey, $typeKey): array {
-        if ($motor) {
-            $stmt = $db->prepare('SELECT company, wo_no FROM task_parts WHERE task_code = ? AND brand_key = ? AND type_key = ? GROUP BY company, wo_no');
-            $stmt->execute([$code, $brandKey, $typeKey]);
-        } else {
-            $stmt = $db->prepare('SELECT company, wo_no FROM task_parts WHERE task_code = ? GROUP BY company, wo_no');
-            $stmt->execute([$code]);
-        }
-        return $stmt->fetchAll();
-    };
-    $tasks = $useMotor ? $scope(true) : [];
-    $level = 'motor+task';
-    if (count($tasks) < THALES_TASK_ODDS_MIN_TASKS) {
-        $tasks = $scope(false);
-        $level = 'task';
-        $useMotor = false;
-    }
-    $n = count($tasks);
+    $stmt = $db->prepare('SELECT company, wo_no FROM task_parts WHERE task_code = ? AND brand_key = ? AND type_key = ? GROUP BY company, wo_no');
+    $stmt->execute([$code, $brandKey, $typeKey]);
+    $n = count($stmt->fetchAll());
     if ($n === 0) {
         return ['level' => 'none', 'tasks' => 0, 'parts' => []];
     }
-    if ($useMotor) {
-        $stmt = $db->prepare("SELECT tp.item_no,
+    $level = $n >= THALES_TASK_ODDS_MIN_TASKS ? 'motor+task' : 'low';
+    $stmt = $db->prepare("SELECT tp.item_no,
             COALESCE(NULLIF(TRIM(i.description), ''), NULLIF(TRIM(i.excel_name), ''), '') description,
             COUNT(DISTINCT tp.company || '|' || tp.wo_no) times,
             GROUP_CONCAT(tp.qty) qtys
             FROM task_parts tp LEFT JOIN items i ON i.item_no = tp.item_no
             WHERE tp.task_code = ? AND tp.brand_key = ? AND tp.type_key = ? AND $vis
             GROUP BY tp.item_no");
-        $stmt->execute([$code, $brandKey, $typeKey]);
-    } else {
-        $stmt = $db->prepare("SELECT tp.item_no,
-            COALESCE(NULLIF(TRIM(i.description), ''), NULLIF(TRIM(i.excel_name), ''), '') description,
-            COUNT(DISTINCT tp.company || '|' || tp.wo_no) times,
-            GROUP_CONCAT(tp.qty) qtys
-            FROM task_parts tp LEFT JOIN items i ON i.item_no = tp.item_no
-            WHERE tp.task_code = ? AND $vis
-            GROUP BY tp.item_no");
-        $stmt->execute([$code]);
-    }
+    $stmt->execute([$code, $brandKey, $typeKey]);
     $parts = [];
     foreach ($stmt->fetchAll() as $row) {
         if (thales_item_is_ignored(null, (string) $row['item_no'])) {
