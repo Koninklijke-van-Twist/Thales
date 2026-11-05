@@ -43,6 +43,8 @@ const THALES_BC_WORKORDER_DEFAULT = [
 ];
 /** Mímir accepteert max. top 10000; top 0 loopt vast. Deel groter dan dit wordt verder opgesplitst. */
 const THALES_MIMIR_CHUNK = 5000;
+/** Tekens waarop een te groot deel verder wordt gesplitst; ook leestekens, want BC-nummers als 'KO-…' en 'PK-…' gaan na het voorvoegsel verder met '-'. */
+const THALES_MIMIR_SPLIT_CHARS = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-./_ +';
 /** Motor-subentities onder een SET. */
 const THALES_ENGINE_SUB_ENTITIES = ['DIESEL ENGINE', 'GAS ENGINE'];
 /** Merkcodes die als onbekend tellen. */
@@ -592,7 +594,7 @@ function thales_odata_quote(string $value): string
 function thales_mimir_each(string $table, array $select, string $key, string $baseFilter, callable $onRow, string $prefix = ''): int
 {
     $count = 0;
-    foreach (str_split('0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ') as $char) {
+    foreach (str_split(THALES_MIMIR_SPLIT_CHARS) as $char) {
         $p = $prefix . $char;
         $filter = 'startswith(' . $key . ',' . thales_odata_quote($p) . ')' . ($baseFilter !== '' ? ' and (' . $baseFilter . ')' : '');
         $rows = thales_mimir_query($table, $select, $filter, THALES_MIMIR_CHUNK);
@@ -653,7 +655,8 @@ function thales_search_text(string $no, string $description): string
 function thales_sync_items(): string
 {
     $cfg = thales_bc_item_config();
-    $since = thales_state('items_synced_on');
+    // Eenmalig opnieuw volledig na de split-fix (eerder ontbraken o.a. alle KO-/PK-artikelen).
+    $since = thales_state('items_full_v') === '2' ? thales_state('items_synced_on') : null;
     $filter = ($since !== null && !empty($cfg['modified'])) ? $cfg['modified'] . ' ge ' . $since : '';
     $today = (new DateTimeImmutable('now', new DateTimeZone('Europe/Amsterdam')))->format('Y-m-d');
     $db = thales_db();
@@ -680,6 +683,7 @@ function thales_sync_items(): string
         throw $e;
     }
     thales_set_state('items_synced_on', $today);
+    thales_set_state('items_full_v', '2');
     return $n . ' artikelen (' . ($filter === '' ? 'volledig' : 'delta') . ')';
 }
 

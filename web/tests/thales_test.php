@@ -107,6 +107,15 @@ $GLOBALS['THALES_HTTP'] = function (string $method, string $url, array $h, ?stri
     }
     return [404, '{}'];
 };
+// splitsen op leestekens: 'KO' raakt het maximum en alle nummers gaan verder met '-'
+$GLOBALS['THALES_MIMIR'] = function (string $table, array $select, string $filter, int $top): array {
+    if ($filter === "startswith(No,'K')" || $filter === "startswith(No,'KO')") { return array_fill(0, THALES_MIMIR_CHUNK, ['No' => 'KO-X']); }
+    if ($filter === "startswith(No,'KO-')") { return [['No' => 'KO-1'], ['No' => 'KO-2']]; }
+    return [];
+};
+$seen = [];
+thales_mimir_each('AppItems', ['No'], 'No', '', function (array $row) use (&$seen): void { $seen[] = $row['No']; });
+check($seen === ['KO-1', 'KO-2'], 'mimir_each splitst ook op \'-\' (KO-…)');
 $mimirCalls = 0;
 $GLOBALS['THALES_MIMIR'] = function (string $table, array $select, string $filter, int $top) use (&$mimirCalls): array {
     $mimirCalls++;
