@@ -168,6 +168,27 @@ check($lookup['role'] === 'SET' && $lookup['motor']['component_no'] === '9000000
 $search = thales_search('startacu', 'PERKINS', '4016TAG2A');
 check(($search['used'][0]['item_no'] ?? '') === 'TST-1' && ($search['other'][0]['item_no'] ?? '') === 'TST-3', 'fuzzy: gebruikt eerst, dan overige (typefout startacu)');
 
+check(thales_state('items_full_v') === '3' && ($st = thales_status()) && $st['items_count'] >= 3 && $st['items_synced_on'] !== null, 'items_full_v=3 + status items_count/synced_on');
+// Excel-naam als weergave als BC leeg is; zoeken/autocomplete op Excel-naam
+$db = thales_db();
+$db->exec("UPDATE items SET description = '', search = ' tst-1 accu excel alias ' WHERE item_no = 'TST-1'");
+$db->exec("INSERT OR REPLACE INTO item_excel_names(item_no, name, times) VALUES('TST-1', 'ACCU EXCEL ALIAS', 2)");
+$db->exec("UPDATE items SET excel_name = 'ACCU EXCEL ALIAS' WHERE item_no = 'TST-1'");
+thales_refresh_item_search();
+$partsExcel = thales_parts('PERKINS', '4016TAG2A');
+check(($partsExcel[0]['item_no'] ?? '') === 'TST-1' && $partsExcel[0]['description'] === 'ACCU EXCEL ALIAS', 'kaart toont Excel-naam als BC leeg is');
+$searchExcel = thales_search('excel alias', 'PERKINS', '4016TAG2A');
+check(($searchExcel['used'][0]['item_no'] ?? '') === 'TST-1', 'fuzzy zoekt ook op Excel-naam');
+$sp = thales_suggest_parts('excel', 'PERKINS', '4016TAG2A');
+check(($sp[0]['value'] ?? '') === 'TST-1' && str_contains($sp[0]['label'] ?? '', 'ACCU EXCEL ALIAS') && str_contains($sp[0]['label'] ?? '', 'TST-1'), 'autocomplete onderdelen: naam + artikelnr');
+$spAll = thales_suggest_parts('STARTACCU');
+check(in_array('TST-3', array_column($spAll, 'value'), true), 'autocomplete zonder motor: alle bekende onderdelen');
+// BC terugzetten voor rest van de suite
+$db->exec("UPDATE items SET description = 'STARTACCU 24V', excel_name = 'ACCU EXCEL ALIAS' WHERE item_no = 'TST-1'");
+thales_refresh_item_search();
+check(thales_parts('PERKINS', '4016TAG2A')[0]['description'] === 'STARTACCU 24V', 'kaart prefereert BC-naam boven Excel-naam');
+
+
 // Werkorders: delta + één maand backfill per nacht
 $cur = (new DateTimeImmutable('now'))->format('Y-m');
 check(thales_state('workorders_backfill_oldest_month|KvT') === $cur && thales_state('workorders_backfill_end|KvT') === (new DateTimeImmutable('first day of last month'))->format('Y-m')
