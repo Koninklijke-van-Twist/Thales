@@ -70,6 +70,7 @@ check(thales_brand('INDUSTRIAL', 'Industrial Perkins ')['key'] === 'PERKINS', 'I
 check(thales_brand('DIVERS')['key'] === '?' && thales_brand('')['key'] === '?', 'DIVERS/leeg = onbekend');
 check(thales_brand('MTU', 'MTU Friedrichshafen ')['label'] === 'MTU Friedrichshafen', 'onbekende code toont Manufacturer_Name getrimd');
 check(thales_type_key('4.236 T') === '4236T' && thales_type_key('T 4.236') === 'T4236', 'typesleutel');
+check(thales_part_hue('WATERFILTER  ', 'AO-1') === thales_part_hue('waterfilter', 'AO-2') && thales_part_hue('WATERFILTER', 'AO-1') !== thales_part_hue('WATERSEPARATOR', 'AO-1') && thales_part_hue('', 'AO-1') === thales_part_hue('', 'AO-1') && thales_part_hue('', 'AO-1') !== thales_part_hue('', 'AO-2'), 'kaartkleur op genormaliseerde naam, fallback artikelnr');
 
 // ---------- synthetisch rapport
 $r = thales_parse_report($fixture, '90000001_20260101_WO2600001_10H_CO_1.xlsx');

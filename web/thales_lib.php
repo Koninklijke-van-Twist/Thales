@@ -1105,6 +1105,16 @@ function thales_component_lookup(string $componentNo): ?array
     ];
 }
 
+/** Hue 0..359 voor onderdeelkaart-topbalk: genormaliseerde weergavenaam, anders artikelnr. */
+function thales_part_hue(string $description, string $itemNo): int
+{
+    $key = preg_replace('/\s+/u', ' ', strtolower(trim($description))) ?? '';
+    if ($key === '') {
+        $key = strtoupper(trim($itemNo));
+    }
+    return (int) (sprintf('%u', crc32($key)) % 360);
+}
+
 /** 0..1: hoe goed $query op $text past (woorden, prefix, kleine typefouten). */
 function thales_fuzzy_score(string $query, string $text): float
 {
