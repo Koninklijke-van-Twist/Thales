@@ -35,7 +35,7 @@ const THALES_BC_ITEM_DEFAULT = [
 /** Werkorders (zelfde webservice als Daedalus; velden bevestigd door Ariadne 05-11-2026). Sleutel: bedrijf + No. */
 const THALES_BC_WORKORDER_DEFAULT = [
     'entity' => 'AppWerkorders',
-    'companies' => ['Koninklijke van Twist'], // Hunter van Twist: besluit Tim
+    'companies' => ['Koninklijke van Twist', 'Hunter van Twist'], // exacte BC-namen (zoals Daedalus)
     'key' => 'No',                 // werkordernummer, bijv. '4085191' of 'WO2600033' (uniek per bedrijf)
     'component' => 'Component_No', // componentnummer; leeg is normaal (8–25%)
     'created' => 'Created_On',     // altijd gevuld: backfill per maand + delta
@@ -821,10 +821,10 @@ function thales_suggest(string $prefix, int $limit = 20): array
         return [];
     }
     $like = str_replace(['\\', '%', '_'], ['\\\\', '\\%', '\\_'], $p) . '%';
-    $stmt = thales_db()->prepare("SELECT value, MIN(kind) kind FROM (
+    $stmt = thales_db()->prepare("SELECT value, GROUP_CONCAT(DISTINCT kind) kind FROM (
         SELECT component_no value, 'component' kind FROM components WHERE component_no LIKE :p ESCAPE '\\'
         UNION SELECT component_no, 'component' FROM report_components WHERE component_no LIKE :p ESCAPE '\\'
-        UNION SELECT wo_no, 'werkorder' FROM workorders WHERE wo_no LIKE :p ESCAPE '\\'
+        UNION SELECT wo_no, 'werkorder ' || company FROM workorders WHERE wo_no LIKE :p ESCAPE '\\'
         UNION SELECT UPPER(wo), 'werkorder' FROM reports WHERE UPPER(wo) LIKE :p ESCAPE '\\'
     ) GROUP BY value ORDER BY value LIMIT " . max(1, $limit));
     $stmt->execute([':p' => $like]);

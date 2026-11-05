@@ -177,7 +177,7 @@ check(count($hits) === 2 && $hits[0]['company'] === 'HvT' && $hits[0]['component
 check(thales_workorder_components('WO2600098')[0]['component_no'] === '' && count(thales_workorder_components('WO2600098')) === 2, 'delta op Start_Date; leeg component bewaard');
 check(thales_workorder_components('WO2600001') === [['company' => '', 'wo_no' => 'WO2600001', 'component_no' => '90000001']], 'werkorder uit rapport als fallback');
 $sugg = array_column(thales_suggest('wo26'), 'value');
-check(in_array('WO2600099', $sugg, true) && in_array('WO2600001', $sugg, true) && array_column(thales_suggest('9000'), 'value') === ['90000001', '90000002', '90000003'], 'autocomplete prefix op werkorders en componenten');
+check(in_array('werkorder HvT,werkorder KvT', array_column(thales_suggest('WO2600099'), 'kind'), true) && in_array('WO2600099', $sugg, true) && in_array('WO2600001', $sugg, true) && array_column(thales_suggest('9000'), 'value') === ['90000001', '90000002', '90000003'], 'autocomplete prefix op werkorders en componenten');
 check(thales_suggest('%') === [] && count(thales_suggest('9', 1)) === 1, 'autocomplete: % letterlijk, limiet');
 
 // Correctie: zelfde item opnieuw gewijzigd => vervangt, geen dubbeltelling
