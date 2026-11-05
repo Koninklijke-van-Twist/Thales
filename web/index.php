@@ -23,11 +23,20 @@ function thales_fmt_qty(mixed $value): string
 }
 
 /**
- * Autocomplete (JSON, zelfde auth): ?suggest=<prefix>
+ * Autocomplete (JSON, zelfde auth): ?suggest=<prefix> | ?suggest_parts=<prefix>&brand=&type=
  */
 if (isset($_GET['suggest'])) {
     header('Content-Type: application/json; charset=utf-8');
     echo json_encode(thales_suggest((string) $_GET['suggest']));
+    exit;
+}
+if (isset($_GET['suggest_parts'])) {
+    header('Content-Type: application/json; charset=utf-8');
+    echo json_encode(thales_suggest_parts(
+        (string) $_GET['suggest_parts'],
+        (string) ($_GET['brand'] ?? ''),
+        (string) ($_GET['type'] ?? '')
+    ));
     exit;
 }
 
@@ -43,6 +52,7 @@ $statusLine = LOC('status.line',
     (string) ($run['status'] ?? '–'), $status['day_index'] ?? '–',
     (int) ($c['ok'] ?? 0), (int) ($c['skipped'] ?? 0), (int) ($c['error'] ?? 0), (int) ($c['pending'] ?? 0),
     (int) ($c['retry'] ?? 0), (int) ($c['given_up'] ?? 0));
+$statusLine .= ' · ' . LOC('status.items', (int) ($status['items_count'] ?? 0), (string) ($status['items_synced_on'] ?? LOC('status.never')));
 
 $brandKey = (string) ($_GET['brand'] ?? '');
 $typeKey = (string) ($_GET['type'] ?? '');
@@ -205,7 +215,8 @@ $results = $tab === 'test' && ($query !== '' || $lookup) ? thales_search($query,
                 <p><?= $lookup['role'] === 'SET' ? h(LOC('test.motor', $m['component_no'])) . '<br>' : '' ?><?= h($motorText($m)) ?>
                     <span class="muted">(<?= h(LOC('lib.source', $m['brand_source'])) ?>)</span></p>
             <?php endif; ?>
-            <label><?= h(LOC('test.search')) ?><br><input type="text" name="q" value="<?= h($query) ?>" autofocus></label>
+            <label><?= h(LOC('test.search')) ?><br><input type="text" name="q" value="<?= h($query) ?>" list="part-suggest" autocomplete="off" autofocus></label>
+            <datalist id="part-suggest"></datalist>
             <button type="submit"><?= h(LOC('button.search')) ?></button>
         </form>
     </section>
@@ -225,20 +236,46 @@ $results = $tab === 'test' && ($query !== '' || $lookup) ? thales_search($query,
     <script>
     (function () {
         var input = document.querySelector('input[name=component]'), list = document.getElementById('component-suggest'), timer = null, last = '';
-        if (!input || !list || !window.fetch) { return; }
-        input.addEventListener('input', function () {
-            clearTimeout(timer);
-            timer = setTimeout(function () {
-                var q = input.value.trim();
-                if (q === last) { return; }
-                last = q;
-                if (q.length < 2) { list.innerHTML = ''; return; }
-                fetch('?suggest=' + encodeURIComponent(q), { credentials: 'same-origin' }).then(function (r) { return r.json(); }).then(function (rows) {
-                    list.innerHTML = '';
-                    rows.forEach(function (row) { var o = document.createElement('option'); o.value = row.value; o.label = row.kind; list.appendChild(o); });
-                }).catch(function () {});
-            }, 200);
-        });
+        if (input && list && window.fetch) {
+            input.addEventListener('input', function () {
+                clearTimeout(timer);
+                timer = setTimeout(function () {
+                    var q = input.value.trim();
+                    if (q === last) { return; }
+                    last = q;
+                    if (q.length < 2) { list.innerHTML = ''; return; }
+                    fetch('?suggest=' + encodeURIComponent(q), { credentials: 'same-origin' }).then(function (r) { return r.json(); }).then(function (rows) {
+                        list.innerHTML = '';
+                        rows.forEach(function (row) { var o = document.createElement('option'); o.value = row.value; o.label = row.kind; list.appendChild(o); });
+                    }).catch(function () {});
+                }, 200);
+            });
+        }
+        var partInput = document.querySelector('input[name=q]'), partList = document.getElementById('part-suggest'), partTimer = null, partLast = '';
+        var brandKey = <?= json_encode((string) ($lookup['motor']['brand_key'] ?? ''), JSON_UNESCAPED_UNICODE) ?>;
+        var typeKey = <?= json_encode((string) ($lookup['motor']['type_key'] ?? ''), JSON_UNESCAPED_UNICODE) ?>;
+        if (partInput && partList && window.fetch) {
+            partInput.addEventListener('input', function () {
+                clearTimeout(partTimer);
+                partTimer = setTimeout(function () {
+                    var q = partInput.value.trim();
+                    if (q === partLast) { return; }
+                    partLast = q;
+                    if (q.length < 2) { partList.innerHTML = ''; return; }
+                    var url = '?suggest_parts=' + encodeURIComponent(q);
+                    if (brandKey) { url += '&brand=' + encodeURIComponent(brandKey) + '&type=' + encodeURIComponent(typeKey); }
+                    fetch(url, { credentials: 'same-origin' }).then(function (r) { return r.json(); }).then(function (rows) {
+                        partList.innerHTML = '';
+                        rows.forEach(function (row) {
+                            var o = document.createElement('option');
+                            o.value = row.value;
+                            o.label = row.label;
+                            partList.appendChild(o);
+                        });
+                    }).catch(function () {});
+                }, 200);
+            });
+        }
     })();
     </script>
 <?php endif; ?>
