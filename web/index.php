@@ -448,7 +448,7 @@ if (isset($_GET['partial']) && (string) $_GET['partial'] === '1') {
 
     <?php if ($results !== null):
         $hasTaskHits = ($results['task'] ?? []) !== [];
-        foreach (['task' => 'test.task_hits', 'used' => ($hasTaskHits ? 'test.used_rest' : 'test.used'), 'other' => 'test.other'] as $key => $title):
+        foreach (['task' => 'test.task_hits', 'used' => 'test.used', 'other' => 'test.other'] as $key => $title):
         if ($key === 'task' && !$hasTaskHits) { continue; }
         if ($key === 'used' && !$lookup) { continue; }
         $rows = $results[$key] ?? [];
@@ -456,12 +456,38 @@ if (isset($_GET['partial']) && (string) $_GET['partial'] === '1') {
     <section>
         <h2><?= h(LOC($title)) ?></h2>
         <?php if ($rows === []): ?><p class="muted"><?= h(LOC('test.none')) ?></p><?php else: ?>
-        <table>
-            <tr><th><?= h(LOC('col.item_no')) ?></th><th><?= h(LOC('col.description')) ?></th><?php if ($key === 'task'): ?><th class="num"><?= h(LOC('col.odds')) ?></th><?php endif; ?><th class="num"><?= h(LOC('col.times')) ?></th><th class="num"><?= h(LOC('col.score')) ?></th></tr>
-            <?php foreach ($rows as $r): ?>
-                <tr><td><?= h($r['item_no']) ?></td><td><?= h($r['description']) ?></td><?php if ($key === 'task'): ?><td class="num"><?= (int) round(((float) ($r['odds'] ?? 0)) * 100) ?>%</td><?php endif; ?><td class="num"><?= (int) ($r['times_used'] ?? $r['times'] ?? 0) ?></td><td class="num"><?= (int) round($r['score'] * 100) ?>%</td></tr>
-            <?php endforeach; ?>
-        </table>
+        <div class="part-grid">
+        <?php foreach ($rows as $r):
+            $desc = (string) ($r['description'] ?? '');
+            $item = (string) $r['item_no'];
+            $hue = thales_part_hue($desc, $item);
+            $times = (int) ($r['times_used'] ?? $r['times'] ?? 0);
+            $scorePct = (int) round(((float) ($r['score'] ?? 0)) * 100);
+            $odds = array_key_exists('odds', $r) ? (float) $r['odds'] : null;
+            $modalQs = http_build_query(array_filter([
+                'tab' => 'library',
+                'brand' => $motorBrand !== '' ? $motorBrand : null,
+                'type' => $motorType !== '' ? $motorType : null,
+                'item' => $item,
+            ], static fn($v) => $v !== null && $v !== ''));
+        ?>
+            <div class="part-card odds-card" draggable="true"
+                 data-item="<?= h($item) ?>"
+                 data-desc="<?= h($desc) ?>"
+                 data-qty="1"
+                 data-hue="<?= (int) $hue ?>"
+                 <?php if ($motorBrand !== ''): ?>data-modal="<?= h($modalQs) ?>"<?php endif; ?>>
+                <span class="part-bar" style="background: hsl(<?= (int) $hue ?>, 55%, 45%);"></span>
+                <button type="button" class="odds-add" title="<?= h(LOC('test.nodig_add')) ?>">+</button>
+                <?php if ($odds !== null): ?>
+                <span class="odds-pct"><?= h(LOC('test.odds_pct', (string) (int) round($odds * 100))) ?></span>
+                <?php endif; ?>
+                <strong class="part-name<?= $desc === '' ? ' muted' : '' ?>"><?= h($desc !== '' ? $desc : LOC('lib.no_description')) ?></strong>
+                <span class="part-no"><?= h($item) ?></span>
+                <span class="muted part-stats"><?= h(LOC('col.times')) ?>: <?= $times ?><?php if ($scorePct > 0): ?> · <small><?= $scorePct ?>%</small><?php endif; ?></span>
+            </div>
+        <?php endforeach; ?>
+        </div>
         <?php endif; ?>
     </section>
     <?php endforeach; endif; ?>
@@ -819,12 +845,18 @@ if (isset($_GET['partial']) && (string) $_GET['partial'] === '1') {
                 }).catch(function () { location.href = '?' + qs; });
         }
         document.addEventListener('click', function (e) {
-            var a = e.target.closest && e.target.closest('a[data-odds-open]');
-            if (!a) { return; }
             if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) { return; }
+            if (e.target.closest && e.target.closest('.odds-add, .odds-qty-pop')) { return; }
+            var a = e.target.closest && e.target.closest('a[data-odds-open]');
+            var card = a
+                ? a.closest('.odds-card')
+                : (e.target.closest && e.target.closest('.odds-card[data-modal]'));
+            if (!card) { return; }
+            if (!a && e.target.closest && e.target.closest('a')) { return; }
+            var qs = card.getAttribute('data-modal') || '';
+            if (!qs) { return; }
             e.preventDefault();
-            var card = a.closest('.odds-card');
-            openModal(card ? card.getAttribute('data-modal') : '');
+            openModal(qs);
         });
         document.addEventListener('keydown', function (e) {
             if (e.key === 'Escape') {
