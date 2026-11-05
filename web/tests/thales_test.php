@@ -204,6 +204,11 @@ check(in_array('TST-3', array_column($spAll, 'value'), true), 'autocomplete zond
 $db->exec("UPDATE items SET description = 'STARTACCU 24V', excel_name = 'ACCU EXCEL ALIAS' WHERE item_no = 'TST-1'");
 thales_refresh_item_search();
 check(thales_parts('PERKINS', '4016TAG2A')[0]['description'] === 'STARTACCU 24V', 'kaart prefereert BC-naam boven Excel-naam');
+$spSta = thales_suggest_parts('sta', 'PERKINS', '4016TAG2A');
+$spStaNos = array_column($spSta, 'value');
+check(in_array('TST-1', $spStaNos, true), 'autocomplete fuzzy op omschrijving (sta → STARTACCU)');
+check(($spStaNos[0] ?? '') === 'TST-1', 'autocomplete met motor: usage van motortype eerst');
+check(in_array('TST-3', $spStaNos, true), 'autocomplete met motor: daarna overige uit cache');
 
 // Dienst-/taak-/resource-artikelen negeren
 check(thales_is_task_item_no('GOH ST24') && thales_is_task_item_no('GOH SA ST24') && thales_is_task_item_no('800000') && !thales_is_task_item_no('TST-1'), 'parser negeert GOH-familie en 8xxxxx');
@@ -315,6 +320,22 @@ check(($sug[0]['value'] ?? '') === 'CO', 'suggest_tasks fuzzy op omschrijving �
 $sug2 = thales_suggest_tasks('goh');
 check(($sug2[0]['value'] ?? '') === 'GOH', 'suggest_tasks prefix op code');
 check(str_contains(thales_task_label('CO'), 'Correctief'), 'task_label toont omschrijving');
+
+// Zoeken/suggest met taakcode: taak+motor eerst (met kans), dan overige motor, dan rest
+$db->exec("INSERT OR REPLACE INTO items(item_no, description, excel_name, bc_type, is_task, search, synced_at) VALUES
+    ('TST-MOTOR', 'MOTOR ONLY FILTER', '', 'Voorraad', 0, ' tst-motor motor only filter ', '2026-01-01')");
+$db->exec("INSERT OR REPLACE INTO usage(brand_key, brand, type_key, type, brand_source, item_no, times_used, qty_total) VALUES
+    ('PERKINS', 'PERKINS', '4016TAG2A', '4016TAG2A', 'bc', 'TST-MOTOR', 2, 2)");
+$withTask = thales_search('TST', 'PERKINS', '4016TAG2A', 50, 'CO');
+$taskNos = array_column($withTask['task'] ?? [], 'item_no');
+$usedNos = array_column($withTask['used'] ?? [], 'item_no');
+$otherNos = array_column($withTask['other'] ?? [], 'item_no');
+check(in_array('TST-1', $taskNos, true) && in_array('TST-2', $taskNos, true), 'zoeken met taak: CO-onderdelen in task-tier');
+check(in_array('TST-MOTOR', $usedNos, true) && !in_array('TST-MOTOR', $taskNos, true), 'zoeken met taak: motor-only ná task-tier');
+check(!in_array('TST-1', $usedNos, true), 'zoeken met taak: task-items niet dubbel in used');
+$sugTask = array_column(thales_suggest_parts('TST', 'PERKINS', '4016TAG2A', 20, 'CO'), 'value');
+check(($sugTask[0] ?? '') === 'TST-1' || ($sugTask[0] ?? '') === 'TST-2', 'suggest met taak: taak+motor eerst');
+check(in_array('TST-MOTOR', $sugTask, true), 'suggest met taak: ook motor-only onderdelen');
 
 
 // ---------- schema-upgrade vanaf pre-#15 DB (subprocess: verse static PDO)
