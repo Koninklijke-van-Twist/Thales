@@ -129,7 +129,21 @@ $GLOBALS['THALES_MIMIR'] = function (string $table, array $select, string $filte
         ];
     }
     if ($table === 'AppItems' && str_contains($filter, "'T'")) {
-        return [['No' => 'TST-1', 'Description' => 'STARTACCU 24V'], ['No' => 'TST-2', 'Description' => 'OLIEFILTER'], ['No' => 'TST-3', 'Description' => 'STARTACCU 12V']];
+        return [
+            ['No' => 'TST-1', 'Description' => 'STARTACCU 24V', 'Type' => 'Voorraad', 'LVS_Maintenance_Task_Item' => false],
+            ['No' => 'TST-2', 'Description' => 'OLIEFILTER', 'Type' => 'Voorraad', 'LVS_Maintenance_Task_Item' => false],
+            ['No' => 'TST-3', 'Description' => 'STARTACCU 12V', 'Type' => 'Voorraad', 'LVS_Maintenance_Task_Item' => false],
+        ];
+    }
+    if ($table === 'AppItems' && (str_contains($filter, "'G'") || str_contains($filter, "'8'") || str_contains($filter, "'S'"))) {
+        return [
+            ['No' => 'GOH ST24', 'Description' => 'Groot onderhoud incl. storingsdienst', 'Type' => 'Voorraad', 'LVS_Maintenance_Task_Item' => true],
+            ['No' => 'GOH SA ST24', 'Description' => 'Groot onderhoud SA ST24', 'Type' => 'Voorraad', 'LVS_Maintenance_Task_Item' => true],
+            ['No' => 'SVC-1', 'Description' => 'Service ding', 'Type' => 'Service', 'LVS_Maintenance_Task_Item' => false],
+        ];
+    }
+    if ($table === 'AppResource') {
+        return str_contains($filter, "'1'") ? [['No' => '1574', 'Name' => 'Mierlo, Ricardo van']] : [];
     }
     if ($table === 'AppWerkorders') {
         $prev = (new DateTimeImmutable('first day of last month'))->format('Y-m-d');
@@ -169,7 +183,7 @@ check($lookup['role'] === 'SET' && $lookup['motor']['component_no'] === '9000000
 $search = thales_search('startacu', 'PERKINS', '4016TAG2A');
 check(($search['used'][0]['item_no'] ?? '') === 'TST-1' && ($search['other'][0]['item_no'] ?? '') === 'TST-3', 'fuzzy: gebruikt eerst, dan overige (typefout startacu)');
 
-check(thales_state('items_full_v') === '3' && ($st = thales_status()) && $st['items_count'] >= 3 && $st['items_synced_on'] !== null, 'items_full_v=3 + status items_count/synced_on');
+check(thales_state('items_full_v') === '4' && ($st = thales_status()) && $st['items_count'] >= 3 && $st['items_synced_on'] !== null, 'items_full_v=4 + status items_count/synced_on');
 // Excel-naam als weergave als BC leeg is; zoeken/autocomplete op Excel-naam
 $db = thales_db();
 $db->exec("UPDATE items SET description = '', search = ' tst-1 accu excel alias ' WHERE item_no = 'TST-1'");
@@ -188,6 +202,32 @@ check(in_array('TST-3', array_column($spAll, 'value'), true), 'autocomplete zond
 $db->exec("UPDATE items SET description = 'STARTACCU 24V', excel_name = 'ACCU EXCEL ALIAS' WHERE item_no = 'TST-1'");
 thales_refresh_item_search();
 check(thales_parts('PERKINS', '4016TAG2A')[0]['description'] === 'STARTACCU 24V', 'kaart prefereert BC-naam boven Excel-naam');
+
+// Dienst-/taak-/resource-artikelen negeren
+check(thales_is_task_item_no('GOH ST24') && thales_is_task_item_no('GOH SA ST24') && thales_is_task_item_no('800000') && !thales_is_task_item_no('TST-1'), 'parser negeert GOH-familie en 8xxxxx');
+$db->exec("INSERT OR REPLACE INTO items(item_no, description, excel_name, bc_type, is_task, search, synced_at) VALUES
+    ('GOH ST24', 'Groot onderhoud', '', 'Voorraad', 1, ' goh st24 ', '2026-01-01'),
+    ('GOH SA ST24', 'GOH SA', '', 'Voorraad', 1, ' goh sa ', '2026-01-01'),
+    ('SVC-1', 'Service', '', 'Service', 0, ' svc ', '2026-01-01'),
+    ('800000', 'Storingsdienst', '', '', 0, ' 800000 ', '2026-01-01'),
+    ('1574', 'Mierlo van R.', '', '', 0, ' 1574 mierlo ', '2026-01-01')");
+$db->exec("INSERT OR REPLACE INTO resources(resource_no, name, synced_at) VALUES('1574', 'Mierlo, Ricardo van', '2026-01-01')");
+$db->exec("INSERT OR REPLACE INTO usage(brand_key, brand, type_key, type, brand_source, item_no, times_used, qty_total) VALUES
+    ('PERKINS', 'PERKINS', '4016TAG2A', '4016TAG2A', 'bc', 'GOH ST24', 5, 5),
+    ('PERKINS', 'PERKINS', '4016TAG2A', '4016TAG2A', 'bc', '1574', 10, 130.32),
+    ('PERKINS', 'PERKINS', '4016TAG2A', '4016TAG2A', 'bc', '800000', 3, 3)");
+$partNos = array_column(thales_parts('PERKINS', '4016TAG2A'), 'item_no');
+check(!in_array('GOH ST24', $partNos, true) && !in_array('1574', $partNos, true) && !in_array('800000', $partNos, true)
+    && in_array('TST-1', $partNos, true), 'parts filtert GOH/resource/800000 weg');
+check(thales_item_is_ignored(['bc_type' => 'Voorraad', 'is_task' => 1], 'GOH SA ST24')
+    && thales_item_is_ignored(['bc_type' => 'Service', 'is_task' => 0], 'SVC-1')
+    && thales_item_is_ignored(null, '1574')
+    && thales_item_is_ignored(['bc_type' => '', 'is_task' => 0], '800001'), 'is_ignored: task/service/resource/8xxxxx');
+$sugIgn = array_column(thales_suggest_parts('GOH'), 'value');
+check(!in_array('GOH ST24', $sugIgn, true) && !in_array('GOH SA ST24', $sugIgn, true), 'autocomplete negeert GOH');
+$searchIgn = thales_search('mierlo', 'PERKINS', '4016TAG2A');
+check(($searchIgn['used'] ?? []) === [] || !in_array('1574', array_column($searchIgn['used'], 'item_no'), true), 'zoeken negeert resource 1574');
+
 
 
 // Werkorders: delta + één maand backfill per nacht

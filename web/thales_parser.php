@@ -52,6 +52,14 @@ function thales_is_task_item_no(string $itemNo): bool
     if ($no === '') {
         return true;
     }
+    // Hele GOH-familie (GOH ST24, GOH SA ST24, …) — spaties/suffixen vallen buiten ^GOH\d*$
+    if (str_starts_with($no, 'GOH')) {
+        return true;
+    }
+    // Storingsdienst e.d. die niet in AppItems staan (800000/800001)
+    if (ctype_digit($no) && str_starts_with($no, '8') && strlen($no) >= 6) {
+        return true;
+    }
     foreach (THALES_TASK_ITEM_NOS as $code) {
         // CO, GOH, SM03, LB100, ST24 …
         if (preg_match('/^' . $code . '\d*$/', $no)) {

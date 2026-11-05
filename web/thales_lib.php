@@ -30,6 +30,8 @@ const THALES_BC_ITEM_DEFAULT = [
     'entity' => 'AppItems',             // alternatief workflowItems negeert $select; AppItems wel
     'key' => 'No',
     'description' => 'Description',
+    'type' => 'Type',                   // BC Type: o.a. Voorraad / Service (zelfde als Elpis)
+    'task_item' => 'LVS_Maintenance_Task_Item', // taak-/dienstartikel (Elpis filtert die weg)
     'modified' => 'Last_Date_Modified', // alleen een datum: delta met 'ge'
 ];
 /** Werkorders (zelfde webservice als Daedalus; velden bevestigd door Ariadne 05-11-2026). Sleutel: bedrijf + No. */
@@ -155,10 +157,11 @@ CREATE TABLE IF NOT EXISTS report_motor (item_id TEXT PRIMARY KEY, component_no 
 CREATE TABLE IF NOT EXISTS workorders (company TEXT NOT NULL, wo_no TEXT NOT NULL, component_no TEXT, created_on TEXT, start_date TEXT, synced_at TEXT,
     PRIMARY KEY (company, wo_no));
 CREATE INDEX IF NOT EXISTS wo_no ON workorders(wo_no);
-CREATE TABLE IF NOT EXISTS items (item_no TEXT PRIMARY KEY, description TEXT, excel_name TEXT NOT NULL DEFAULT '', search TEXT, synced_at TEXT);
+CREATE TABLE IF NOT EXISTS items (item_no TEXT PRIMARY KEY, description TEXT, excel_name TEXT NOT NULL DEFAULT '', bc_type TEXT NOT NULL DEFAULT '', is_task INTEGER NOT NULL DEFAULT 0, search TEXT, synced_at TEXT);
 CREATE TABLE IF NOT EXISTS usage (
     brand_key TEXT, brand TEXT, type_key TEXT, type TEXT, brand_source TEXT, item_no TEXT, times_used INTEGER, qty_total REAL,
     PRIMARY KEY (brand_key, type_key, item_no));
+CREATE TABLE IF NOT EXISTS resources (resource_no TEXT PRIMARY KEY, name TEXT, synced_at TEXT);
 SQL);
     thales_migrate($pdo);
     return $pdo;
@@ -180,9 +183,16 @@ function thales_migrate(PDO $pdo): void
     if (!in_array('excel_name', $itemCols, true)) {
         $pdo->exec("ALTER TABLE items ADD COLUMN excel_name TEXT NOT NULL DEFAULT ''");
     }
+    if (!in_array('bc_type', $itemCols, true)) {
+        $pdo->exec("ALTER TABLE items ADD COLUMN bc_type TEXT NOT NULL DEFAULT ''");
+    }
+    if (!in_array('is_task', $itemCols, true)) {
+        $pdo->exec('ALTER TABLE items ADD COLUMN is_task INTEGER NOT NULL DEFAULT 0');
+    }
     $pdo->exec('CREATE TABLE IF NOT EXISTS item_excel_names (
         item_no TEXT NOT NULL, name TEXT NOT NULL, times INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (item_no, name))');
+    $pdo->exec('CREATE TABLE IF NOT EXISTS resources (resource_no TEXT PRIMARY KEY, name TEXT, synced_at TEXT)');
 }
 
 /** Rapport na een harde crash of fatale fout op de retry-lijst zetten (na een week: given_up). */
@@ -660,18 +670,79 @@ function thales_search_text(string $no, string $description): string
     return ' ' . strtolower($no . ' ' . (string) preg_replace('/\s+/u', ' ', $description)) . ' ';
 }
 
+/** Expliciete negeerlijst (niet in AppItems): storingsdienst-artikelen. */
+const THALES_IGNORE_ITEM_NOS = ['800000', '800001'];
+
+/**
+ * Dienst-/taak-/resource-regels negeren (Elpis + resources):
+ * - Type Service of LVS_Maintenance_Task_Item (vangt hele GOH-familie)
+ * - nummer in AppResource (uren/personen, bijv. 1574 Mierlo)
+ * - GOH-prefix / 8xxxxx-fallback / expliciete lijst als Type nog onbekend is
+ */
+function thales_item_is_ignored(?array $item, string $itemNo = ''): bool
+{
+    $no = strtoupper(trim($itemNo !== '' ? $itemNo : (string) ($item['item_no'] ?? '')));
+    if ($no === '' || in_array($no, THALES_IGNORE_ITEM_NOS, true) || str_starts_with($no, 'GOH')) {
+        return true;
+    }
+    if (thales_is_resource_no($no)) {
+        return true;
+    }
+    if ($item !== null) {
+        $type = trim((string) ($item['bc_type'] ?? ''));
+        $isTask = (int) ($item['is_task'] ?? 0) === 1;
+        if ($isTask || strcasecmp($type, 'Service') === 0) {
+            return true;
+        }
+        // Alleen echte artikelen (BC: Voorraad ≈ Inventory/Item)
+        if ($type !== '') {
+            return !in_array(strtolower($type), ['voorraad', 'inventory', 'item'], true);
+        }
+    }
+    return ctype_digit($no) && str_starts_with($no, '8');
+}
+
+/** SQL WHERE: zichtbaar onderdeel (LEFT JOIN items $alias; resources via NOT EXISTS). */
+function thales_sql_item_visible(string $alias = 'i', string $itemNoExpr = 'u.item_no'): string
+{
+    return '('
+        . "LOWER(TRIM(COALESCE($alias.bc_type, ''))) NOT IN ('service')"
+        . " AND COALESCE($alias.is_task, 0) = 0"
+        . " AND $itemNoExpr NOT IN ('800000','800001')"
+        . " AND $itemNoExpr NOT GLOB 'GOH*'"
+        . " AND NOT EXISTS (SELECT 1 FROM resources r WHERE r.resource_no = $itemNoExpr)"
+        . " AND ("
+        . "LOWER(TRIM(COALESCE($alias.bc_type, ''))) IN ('voorraad','inventory','item')"
+        . " OR ("
+        . "TRIM(COALESCE($alias.bc_type, '')) = ''"
+        . " AND NOT ($itemNoExpr GLOB '8[0-9]*' AND $itemNoExpr NOT GLOB '*[^0-9]*')"
+        . ")))";
+}
+
+function thales_is_resource_no(string $no): bool
+{
+    $no = strtoupper(trim($no));
+    if ($no === '') {
+        return false;
+    }
+    $stmt = thales_db()->prepare('SELECT 1 FROM resources WHERE resource_no = ? LIMIT 1');
+    $stmt->execute([$no]);
+    return $stmt->fetchColumn() !== false;
+}
+
 /** Artikelcache (omschrijvingen): eerste keer volledig in delen, daarna delta op Last_Date_Modified (datum). */
 function thales_sync_items(): string
 {
     $cfg = thales_bc_item_config();
-    // v3: eenmalig opnieuw volledig na de batch-commit-fix (v2 zat in één SQLite-transactie; bij timeout bleef items leeg).
-    $since = thales_state('items_full_v') === '3' ? thales_state('items_synced_on') : null;
+    // v4: eenmalig opnieuw volledig om Type + LVS_Maintenance_Task_Item in de cache te krijgen.
+    $since = thales_state('items_full_v') === '4' ? thales_state('items_synced_on') : null;
     $filter = ($since !== null && !empty($cfg['modified'])) ? $cfg['modified'] . ' ge ' . $since : '';
     $today = (new DateTimeImmutable('now', new DateTimeZone('Europe/Amsterdam')))->format('Y-m-d');
     $db = thales_db();
+    $select = [$cfg['key'], $cfg['description'], $cfg['type'], $cfg['task_item']];
     // Geen één lange transactie over alle Mímir-calls: bij timeout/crash ging alles in rollback en bleef de cache leeg.
-    $ins = $db->prepare('INSERT INTO items(item_no, description, excel_name, search, synced_at) VALUES(?, ?, \'\', ?, ?)
-        ON CONFLICT(item_no) DO UPDATE SET description = excluded.description, search = excluded.search, synced_at = excluded.synced_at');
+    $ins = $db->prepare('INSERT INTO items(item_no, description, excel_name, bc_type, is_task, search, synced_at) VALUES(?, ?, \'\', ?, ?, ?, ?)
+        ON CONFLICT(item_no) DO UPDATE SET description = excluded.description, bc_type = excluded.bc_type, is_task = excluded.is_task, search = excluded.search, synced_at = excluded.synced_at');
     $n = 0;
     $batch = 0;
     $db->beginTransaction();
@@ -681,7 +752,10 @@ function thales_sync_items(): string
             return;
         }
         $description = trim((string) ($row[$cfg['description']] ?? $row['Description'] ?? $row['description'] ?? ''));
-        $ins->execute([$no, $description, thales_search_text($no, $description), $today]);
+        $bcType = trim((string) ($row[$cfg['type']] ?? $row['Type'] ?? ''));
+        $taskRaw = $row[$cfg['task_item']] ?? $row['LVS_Maintenance_Task_Item'] ?? false;
+        $isTask = $taskRaw === true || $taskRaw === 1 || $taskRaw === '1' || $taskRaw === 'true' ? 1 : 0;
+        $ins->execute([$no, $description, $bcType, $isTask, thales_search_text($no, $description), $today]);
         $n++;
         $batch++;
         if ($batch >= 500) {
@@ -692,13 +766,13 @@ function thales_sync_items(): string
         }
     };
     try {
-        $rows = $filter !== '' ? thales_mimir_query((string) $cfg['entity'], [$cfg['key'], $cfg['description']], $filter) : null;
+        $rows = $filter !== '' ? thales_mimir_query((string) $cfg['entity'], $select, $filter) : null;
         if ($rows !== null && count($rows) < THALES_MIMIR_CHUNK) {
             foreach ($rows as $row) {
                 $onRow($row);
             }
         } else {
-            thales_mimir_each((string) $cfg['entity'], [$cfg['key'], $cfg['description']], (string) $cfg['key'], $filter, $onRow);
+            thales_mimir_each((string) $cfg['entity'], $select, (string) $cfg['key'], $filter, $onRow);
         }
         $db->commit();
     } catch (Throwable $e) {
@@ -711,8 +785,47 @@ function thales_sync_items(): string
         return '0 artikelen (volledig, niet gemarkeerd als gesynchroniseerd)';
     }
     thales_set_state('items_synced_on', $today);
-    thales_set_state('items_full_v', '3');
+
+    thales_set_state('items_full_v', '4');
     return $n . ' artikelen (' . ($filter === '' ? 'volledig' : 'delta') . ')';
+}
+
+/** BC-resources (uren/personen): nummers die in Excel als "onderdeel" kunnen staan, bijv. 1574. */
+function thales_sync_resources(): string
+{
+    $today = (new DateTimeImmutable('now', new DateTimeZone('Europe/Amsterdam')))->format('Y-m-d');
+    $db = thales_db();
+    $ins = $db->prepare('INSERT INTO resources(resource_no, name, synced_at) VALUES(?, ?, ?)
+        ON CONFLICT(resource_no) DO UPDATE SET name = excluded.name, synced_at = excluded.synced_at');
+    $n = 0;
+    $batch = 0;
+    $db->beginTransaction();
+    $onRow = static function (array $row) use ($ins, $today, $db, &$n, &$batch): void {
+        $no = strtoupper(trim((string) ($row['No'] ?? '')));
+        if ($no === '') {
+            return;
+        }
+        $name = trim((string) ($row['Name'] ?? $row['Description'] ?? ''));
+        $ins->execute([$no, $name, $today]);
+        $n++;
+        $batch++;
+        if ($batch >= 500) {
+            $db->commit();
+            $db->beginTransaction();
+            $batch = 0;
+        }
+    };
+    try {
+        thales_mimir_each('AppResource', ['No', 'Name'], 'No', '', $onRow);
+        $db->commit();
+    } catch (Throwable $e) {
+        if ($db->inTransaction()) {
+            $db->rollBack();
+        }
+        throw $e;
+    }
+    thales_set_state('resources_synced_on', $today);
+    return $n . ' resources';
 }
 
 function thales_bc_workorder_config(): array
@@ -934,9 +1047,14 @@ function thales_rebuild_aggregates(): void
         $m = thales_resolve_motor($components);
         $ins->execute([$itemId, $m['component_no'], $m['brand_key'], $m['brand'], $m['type_key'], $m['type'], $m['brand_source']]);
     }
-    $db->exec('INSERT INTO usage(brand_key, brand, type_key, type, brand_source, item_no, times_used, qty_total)
+    $vis = thales_sql_item_visible('i', 'p.item_no');
+    $db->exec("INSERT INTO usage(brand_key, brand, type_key, type, brand_source, item_no, times_used, qty_total)
         SELECT m.brand_key, MAX(m.brand), m.type_key, MAX(m.type), MIN(m.brand_source), p.item_no, COUNT(DISTINCT p.item_id), SUM(p.qty)
-        FROM report_motor m JOIN report_parts p ON p.item_id = m.item_id GROUP BY m.brand_key, m.type_key, p.item_no');
+        FROM report_motor m
+        JOIN report_parts p ON p.item_id = m.item_id
+        LEFT JOIN items i ON i.item_no = p.item_no
+        WHERE $vis
+        GROUP BY m.brand_key, m.type_key, p.item_no");
     // Excel-namen uit al verwerkte rapporten (geen herparse); meest voorkomende naam per artikel op items.excel_name.
     $db->exec('DELETE FROM item_excel_names');
     $db->exec("INSERT INTO item_excel_names(item_no, name, times)
@@ -985,10 +1103,15 @@ function thales_nightly(?int $budgetSeconds = null): array
     try {
         thales_progress('Start nightly');
         // BC-cache eerst: anders kan een lange rapport-backfill het hele budget opmaken en blijft de cache leeg.
-        foreach (['components', 'items', 'workorders'] as $key) {
+        foreach (['components', 'items', 'resources', 'workorders'] as $key) {
             thales_progress('BC-cache bijwerken: ' . $key);
             try {
-                $summary[$key] = match ($key) { 'items' => thales_sync_items(), 'workorders' => thales_sync_workorders(), default => thales_sync_components() };
+                $summary[$key] = match ($key) {
+                    'items' => thales_sync_items(),
+                    'resources' => thales_sync_resources(),
+                    'workorders' => thales_sync_workorders(),
+                    default => thales_sync_components(),
+                };
             } catch (Throwable $e) {
                 $summary[$key] = 'fout: ' . $e->getMessage();
                 thales_log('BC ' . $key . ': ' . $e->getMessage());
@@ -1035,7 +1158,11 @@ function thales_status(): array
 /** @return list<array{brand_key:string,brand:string,types:list<array{type_key:string,type:string}>}> */
 function thales_brands(): array
 {
-    $rows = thales_db()->query('SELECT brand_key, MAX(brand) brand, type_key, MAX(type) type, COUNT(*) parts FROM usage GROUP BY brand_key, type_key ORDER BY brand_key = \'?\', brand, type_key')->fetchAll();
+    $vis = thales_sql_item_visible('i', 'u.item_no');
+    $rows = thales_db()->query("SELECT u.brand_key, MAX(u.brand) brand, u.type_key, MAX(u.type) type, COUNT(*) parts
+        FROM usage u LEFT JOIN items i ON i.item_no = u.item_no
+        WHERE $vis
+        GROUP BY u.brand_key, u.type_key ORDER BY u.brand_key = '?', MAX(u.brand), u.type_key")->fetchAll();
     $out = [];
     foreach ($rows as $row) {
         $out[$row['brand_key']] ??= ['brand_key' => $row['brand_key'], 'brand' => $row['brand'], 'types' => []];
@@ -1048,11 +1175,13 @@ function thales_brands(): array
 function thales_parts(string $brandKey, string $typeKey): array
 {
     // Weergavenaam: BC-omschrijving, anders meest voorkomende Excel-naam (zelfde opmaak).
+    $vis = thales_sql_item_visible('i', 'u.item_no');
     $stmt = thales_db()->prepare("SELECT u.item_no,
         COALESCE(NULLIF(TRIM(i.description), ''), NULLIF(TRIM(i.excel_name), ''), '') description,
         u.times_used, u.qty_total, u.brand_source
         FROM usage u LEFT JOIN items i ON i.item_no = u.item_no
-        WHERE u.brand_key = ? AND u.type_key = ? ORDER BY u.times_used DESC, u.qty_total DESC");
+        WHERE u.brand_key = ? AND u.type_key = ? AND $vis
+        ORDER BY u.times_used DESC, u.qty_total DESC");
     $stmt->execute([$brandKey, $typeKey]);
     return $stmt->fetchAll();
 }
@@ -1155,14 +1284,18 @@ function thales_search(string $query, string $brandKey = '', string $typeKey = '
     if ($brandKey !== '') {
         $stmt = $db->prepare("SELECT u.item_no,
             COALESCE(NULLIF(TRIM(i.description), ''), NULLIF(TRIM(i.excel_name), ''), '') description,
-            COALESCE(i.search, '') search, u.times_used, u.qty_total, u.brand_source
+            COALESCE(i.search, '') search, u.times_used, u.qty_total, u.brand_source,
+            COALESCE(i.bc_type, '') bc_type, COALESCE(i.is_task, 0) is_task
             FROM usage u LEFT JOIN items i ON i.item_no = u.item_no
             WHERE u.brand_key = ? AND u.type_key = ?");
         $stmt->execute([$brandKey, $typeKey]);
         foreach ($stmt->fetchAll() as $part) {
+            if (thales_item_is_ignored($part, (string) $part['item_no'])) {
+                continue;
+            }
             $hay = trim((string) $part['search']) !== '' ? (string) $part['search'] : ($part['item_no'] . ' ' . $part['description']);
             $part['score'] = $query === '' ? 1.0 : thales_fuzzy_score($query, $hay);
-            unset($part['search']);
+            unset($part['search'], $part['bc_type'], $part['is_task']);
             if ($part['score'] >= 0.5) {
                 $used[$part['item_no']] = $part;
             }
@@ -1175,16 +1308,17 @@ function thales_search(string $query, string $brandKey = '', string $typeKey = '
         $where = implode(' OR ', array_fill(0, count($tokens), 'search LIKE ?'));
         $stmt = $db->prepare("SELECT i.item_no,
             COALESCE(NULLIF(TRIM(i.description), ''), NULLIF(TRIM(i.excel_name), ''), '') description,
-            COALESCE(i.search, '') search, COALESCE(SUM(u.times_used), 0) times_used
+            COALESCE(i.search, '') search, COALESCE(SUM(u.times_used), 0) times_used,
+            COALESCE(i.bc_type, '') bc_type, COALESCE(i.is_task, 0) is_task
             FROM items i LEFT JOIN usage u ON u.item_no = i.item_no WHERE " . $where . ' GROUP BY i.item_no LIMIT 5000');
         $stmt->execute(array_map(static fn($t): string => '%' . mb_substr($t, 0, 3) . '%', $tokens));
         foreach ($stmt->fetchAll() as $row) {
-            if (isset($used[$row['item_no']])) {
+            if (isset($used[$row['item_no']]) || thales_item_is_ignored($row, (string) $row['item_no'])) {
                 continue;
             }
             $hay = trim((string) $row['search']) !== '' ? (string) $row['search'] : ($row['item_no'] . ' ' . $row['description']);
             $row['score'] = thales_fuzzy_score($query, $hay);
-            unset($row['search']);
+            unset($row['search'], $row['bc_type'], $row['is_task']);
             if ($row['score'] >= 0.5) {
                 $other[] = $row;
             }
@@ -1207,11 +1341,12 @@ function thales_suggest_parts(string $prefix, string $brandKey = '', string $typ
     $esc = str_replace(['\\', '%', '_'], ['\\\\', '\\%', '\\_'], strtolower($q));
     $like = '%' . $esc . '%';
     $db = thales_db();
+    $vis = thales_sql_item_visible('i', 'i.item_no');
     if ($brandKey !== '') {
         $sql = "SELECT i.item_no,
             COALESCE(NULLIF(TRIM(i.description), ''), NULLIF(TRIM(i.excel_name), ''), i.item_no) name
             FROM usage u JOIN items i ON i.item_no = u.item_no
-            WHERE u.brand_key = ? AND u.type_key = ?
+            WHERE u.brand_key = ? AND u.type_key = ? AND $vis
               AND (LOWER(i.item_no) LIKE ? ESCAPE '\\' OR i.search LIKE ? ESCAPE '\\'
                    OR LOWER(COALESCE(i.description, '')) LIKE ? ESCAPE '\\'
                    OR LOWER(COALESCE(i.excel_name, '')) LIKE ? ESCAPE '\\'
@@ -1223,10 +1358,10 @@ function thales_suggest_parts(string $prefix, string $brandKey = '', string $typ
         $sql = "SELECT i.item_no,
             COALESCE(NULLIF(TRIM(i.description), ''), NULLIF(TRIM(i.excel_name), ''), i.item_no) name
             FROM items i
-            WHERE LOWER(i.item_no) LIKE ? ESCAPE '\\' OR i.search LIKE ? ESCAPE '\\'
+            WHERE $vis AND (LOWER(i.item_no) LIKE ? ESCAPE '\\' OR i.search LIKE ? ESCAPE '\\'
                OR LOWER(COALESCE(i.description, '')) LIKE ? ESCAPE '\\'
                OR LOWER(COALESCE(i.excel_name, '')) LIKE ? ESCAPE '\\'
-               OR EXISTS (SELECT 1 FROM item_excel_names x WHERE x.item_no = i.item_no AND LOWER(x.name) LIKE ? ESCAPE '\\')
+               OR EXISTS (SELECT 1 FROM item_excel_names x WHERE x.item_no = i.item_no AND LOWER(x.name) LIKE ? ESCAPE '\\'))
             ORDER BY i.item_no LIMIT " . max(1, (int) $limit);
         $stmt = $db->prepare($sql);
         $stmt->execute([$like, $like, $like, $like, $like]);
