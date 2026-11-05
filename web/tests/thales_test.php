@@ -147,15 +147,21 @@ $GLOBALS['THALES_MIMIR'] = function (string $table, array $select, string $filte
     }
     if ($table === 'AppWerkorders') {
         $prev = (new DateTimeImmutable('first day of last month'))->format('Y-m-d');
-        // Description-probe / gerichte batch (niet in brede delta/backfill-select)
-        if (in_array('Description', $select, true)) {
+        // KVT_Memo-probe / gerichte batch (niet in brede delta/backfill-select)
+        if (in_array('KVT_Memo', $select, true)) {
             if ($filter === '') {
-                return [['No' => 'PROBE', 'Description' => '']];
+                return [['No' => 'PROBE', 'KVT_Memo' => '']];
             }
             if (preg_match_all("/No eq '([^']+)'/", $filter, $mm)) {
                 $out = [];
                 foreach ($mm[1] as $no) {
-                    $out[] = ['No' => $no, 'Description' => strtoupper($no) === 'WO2600099' ? 'Correctief bij klant' : ''];
+                    $memo = '';
+                    if (strtoupper($no) === 'WO2600099') {
+                        $memo = "Correctief bij klant\nTweede regel memo";
+                    } elseif (strtoupper($no) === 'WO2600033') {
+                        $memo = 'Climax Molybdenum Botlek RTT Iveco 80Kva OH met een lange vervolgtekst die over de 120 tekens heen gaat zodat de preview afkapt';
+                    }
+                    $out[] = ['No' => $no, 'KVT_Memo' => $memo];
                 }
                 return $out;
             }
@@ -357,34 +363,91 @@ check(($sugTask[0] ?? '') === 'TST-1' || ($sugTask[0] ?? '') === 'TST-2', 'sugge
 check(in_array('TST-MOTOR', $sugTask, true), 'suggest met taak: ook motor-only onderdelen');
 
 
-// ---------- WO Description: gericht vullen, bewaren bij sync, suggest/fuzzy
+// ---------- WO-memo (KVT_Memo): gericht vullen, bewaren bij sync, suggest/fuzzy, preview
+$prev = thales_wo_memo_preview("Eerste regel memo\nTweede regel");
+check($prev['short'] === 'Eerste regel memo' && str_contains($prev['full'], "\n"), 'memo-preview: eerste regel + volledige tekst');
+$long = str_repeat('x', 130);
+$prevLong = thales_wo_memo_preview($long, 120);
+check(mb_strlen($prevLong['short']) === 120 && str_ends_with($prevLong['short'], '…'), 'memo-preview: afkappen op 120');
+check(thales_wo_memo_normalize("  a\nb  ") === "a\nb", 'memo-normalize behoudt interne regeleinden');
+
 $db->exec("UPDATE workorders SET description = NULL WHERE wo_no = 'WO2600099'");
 $fill = thales_fill_workorder_descriptions(microtime(true) + 30, gmdate('c', time() - 86400));
-check(str_contains($fill, 'gevuld') || str_contains($fill, 'gezet'), 'description-fill: statusregel');
+check(str_contains($fill, 'gevuld') || str_contains($fill, 'gezet'), 'memo-fill: statusregel');
 $woDesc = thales_workorder_components('WO2600099');
-check(($woDesc[0]['description'] ?? '') === 'Correctief bij klant' || ($woDesc[1]['description'] ?? '') === 'Correctief bij klant', 'description-fill: WO2600099 krijgt Description');
+$gotMemo = '';
+foreach ($woDesc as $h) {
+    if (str_contains((string) ($h['description'] ?? ''), 'Correctief bij klant')) { $gotMemo = (string) $h['description']; break; }
+}
+check($gotMemo !== '' && str_contains($gotMemo, "\n"), 'memo-fill: WO2600099 krijgt meerregelige KVT_Memo');
 // Sync mag description niet wissen
 $before = (string) $db->query("SELECT description FROM workorders WHERE company='KvT' AND wo_no='WO2600099'")->fetchColumn();
 thales_store_workorders('KvT', "No eq 'WO2600099'", '2026-11-05');
 $after = (string) $db->query("SELECT description FROM workorders WHERE company='KvT' AND wo_no='WO2600099'")->fetchColumn();
-check($before !== '' && $before === $after, 'description blijft staan na store_workorders');
+check($before !== '' && $before === $after, 'memo blijft staan na store_workorders');
 $sugDesc = thales_suggest('Correctief bij');
-check(in_array('WO2600099', array_column($sugDesc, 'value'), true), 'suggest fuzzy op WO-description');
-$lab = null;
+check(in_array('WO2600099', array_column($sugDesc, 'value'), true), 'suggest fuzzy op WO-memo');
+$lab = null; $tit = null;
 foreach ($sugDesc as $row) {
-    if ($row['value'] === 'WO2600099') { $lab = $row['label'] ?? ''; break; }
+    if ($row['value'] === 'WO2600099') { $lab = $row['label'] ?? ''; $tit = $row['title'] ?? ''; break; }
 }
-check(is_string($lab) && str_contains($lab, 'Correctief bij klant'), 'suggest label toont No · Description');
-// Ontbrekend veld: Ariadne-melding, geen crash
+check(is_string($lab) && str_contains($lab, 'Correctief bij klant') && !str_contains($lab, 'Tweede regel'), 'suggest label: eerste regel memo');
+check(is_string($tit) && str_contains($tit, 'Tweede regel'), 'suggest title: volledige memo');
+// Fuzzy op tweede regel / volledige tekst
+$sugLine2 = thales_suggest('Tweede regel memo');
+check(in_array('WO2600099', array_column($sugLine2, 'value'), true), 'suggest fuzzy op tweede memo-regel');
+// Lege memo → '' (niet opnieuw)
+$db->exec("INSERT OR REPLACE INTO workorders(company, wo_no, component_no, task_code, task_description, description, created_on, start_date, synced_at) VALUES ('KvT','WOEMPTY','','','',NULL,'2026-01-01','2026-01-01','2026-01-01')");
+$fillEmpty = thales_fill_workorder_descriptions(microtime(true) + 30, gmdate('c', time() - 86400));
+$emptyVal = $db->query("SELECT description FROM workorders WHERE wo_no='WOEMPTY'")->fetchColumn();
+check($emptyVal === '', 'lege memo → description empty string');
+// Ontbrekend veld: nette melding, geen crash
 $GLOBALS['THALES_MIMIR'] = function (string $table, array $select, string $filter, int $top, ?string $company = null): array {
-    if ($table === 'AppWerkorders' && in_array('Description', $select, true)) {
-        throw new RuntimeException('Mímir AppWerkorders HTTP 400: Onbekende kolom: Description');
+    if ($table === 'AppWerkorders' && in_array('KVT_Memo', $select, true)) {
+        throw new RuntimeException('Mímir AppWerkorders HTTP 400: Onbekende kolom: KVT_Memo');
     }
     return [];
 };
 thales_set_state('workorders_description_field', '0');
 $missing = thales_fill_workorder_descriptions(microtime(true) + 10);
-check(str_contains($missing, 'ontbreekt') && str_contains($missing, 'Ariadne'), 'description ontbreekt → Ariadne-melding');
+check(str_contains($missing, 'ontbreekt') && str_contains($missing, 'KVT_Memo'), 'KVT_Memo ontbreekt → nette melding');
+
+// Eenmalige reset: lege descriptions → NULL + state-flag
+$resetDir = sys_get_temp_dir() . '/thales-memo-reset-' . getmypid();
+@mkdir($resetDir);
+$resetDb = $resetDir . '/thales.sqlite';
+@unlink($resetDb);
+$oldR = new PDO('sqlite:' . $resetDb);
+$oldR->exec("CREATE TABLE state (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE workorders (company TEXT NOT NULL, wo_no TEXT NOT NULL, component_no TEXT, task_code TEXT NOT NULL DEFAULT '', task_description TEXT NOT NULL DEFAULT '', description TEXT, created_on TEXT, start_date TEXT, synced_at TEXT, PRIMARY KEY (company, wo_no));
+CREATE TABLE reports (item_id TEXT PRIMARY KEY, name TEXT, web_url TEXT, folder_name TEXT, equipment_no TEXT, report_date TEXT, wo TEXT, task_codes TEXT, size INTEGER, created TEXT, modified TEXT, parse_status TEXT NOT NULL DEFAULT 'pending', parse_note TEXT, sheet TEXT, processed_at TEXT);
+CREATE TABLE report_components (item_id TEXT NOT NULL, role TEXT, component_no TEXT, brand_raw TEXT, brand TEXT, type TEXT, serial TEXT, is_motor INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE report_parts (item_id TEXT NOT NULL, line INTEGER, item_no TEXT, description_raw TEXT, qty REAL, unit TEXT);
+CREATE TABLE components (component_no TEXT PRIMARY KEY, parent_no TEXT, sub_entity TEXT, manufacturer_code TEXT, manufacturer_name TEXT, model TEXT, synced_at TEXT);
+CREATE TABLE report_motor (item_id TEXT PRIMARY KEY, component_no TEXT, brand_key TEXT, brand TEXT, type_key TEXT, type TEXT, brand_source TEXT);
+CREATE TABLE items (item_no TEXT PRIMARY KEY, description TEXT, excel_name TEXT NOT NULL DEFAULT '', bc_type TEXT NOT NULL DEFAULT '', is_task INTEGER NOT NULL DEFAULT 0, search TEXT, synced_at TEXT);
+CREATE TABLE usage (brand_key TEXT, brand TEXT, type_key TEXT, type TEXT, brand_source TEXT, item_no TEXT, times_used INTEGER, qty_total REAL, PRIMARY KEY (brand_key, type_key, item_no));
+CREATE TABLE resources (resource_no TEXT PRIMARY KEY, name TEXT, synced_at TEXT);
+CREATE TABLE folders (id TEXT PRIMARY KEY, name TEXT, parent_id TEXT);
+INSERT INTO workorders(company, wo_no, component_no, description) VALUES ('KvT','WO-EMPTY','C1',''), ('KvT','WO-FULL','C2','blijft staan');
+INSERT INTO state(key, value) VALUES ('workorders_description_field','0'), ('schema_version','4');");
+$oldR = null;
+$cmdR = escapeshellarg(PHP_BINARY) . ' -r ' . escapeshellarg(
+    '$GLOBALS["THALES_DATA_DIR"]=' . var_export($resetDir, true) . ';'
+    . 'require ' . var_export(dirname(__DIR__) . '/thales_lib.php', true) . ';'
+    . '$db=thales_db();'
+    . '$empty=$db->query("SELECT description FROM workorders WHERE wo_no=\"WO-EMPTY\"")->fetchColumn();'
+    . '$full=(string)$db->query("SELECT description FROM workorders WHERE wo_no=\"WO-FULL\"")->fetchColumn();'
+    . '$flag=(string)$db->query("SELECT value FROM state WHERE key=\"workorders_memo_reset\"")->fetchColumn();'
+    . '$field=$db->query("SELECT value FROM state WHERE key=\"workorders_description_field\"")->fetchColumn();'
+    . 'if ($empty !== null) {fwrite(STDERR,"empty not null\n"); exit(1);}'
+    . 'if ($full !== "blijft staan") {fwrite(STDERR,"full wiped\n"); exit(1);}'
+    . 'if ($flag !== "1") {fwrite(STDERR,"no reset flag\n"); exit(1);}'
+    . 'if ($field !== false && $field !== null && (string)$field !== "") {fwrite(STDERR,"field state not cleared\n"); exit(1);}'
+    . 'echo "memo-reset-ok\n";'
+);
+exec($cmdR, $outR, $codeR);
+check($codeR === 0 && ($outR[0] ?? '') === 'memo-reset-ok', 'migratie v5: lege descriptions → NULL (memo-reset)');
 
 // ---------- schema-upgrade vanaf pre-#15 DB (subprocess: verse static PDO)
 $upgradeDir = sys_get_temp_dir() . '/thales-upgrade-' . getmypid();
