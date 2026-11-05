@@ -159,7 +159,7 @@ $results = $tab === 'test' && ($query !== '' || $lookup) ? thales_search($query,
         <h2 id="parts-title"><?= h($brandKey) ?> · <?= h($typeKey !== '' ? $typeKey : LOC('lib.type_unknown')) ?></h2>
         <p class="muted"><?= h(LOC('lib.source', (string) ($parts[0]['brand_source'] ?? '–'))) ?> · <?= h(LOC('lib.pick')) ?></p>
         <div class="part-grid">
-            <?php foreach ($parts as $p): $isActive = $p['item_no'] === $itemNo; $hue = crc32($p['item_no']) % 360; ?>
+            <?php foreach ($parts as $p): $isActive = $p['item_no'] === $itemNo; $hue = thales_part_hue((string) $p['description'], (string) $p['item_no']); ?>
                 <a class="part-card<?= $isActive ? ' active' : '' ?>" href="?<?= h(http_build_query(['tab' => 'library', 'brand' => $brandKey, 'type' => $typeKey, 'item' => $p['item_no']])) ?>">
                     <span class="part-bar" style="background: hsl(<?= (int) $hue ?>, 55%, 45%);"></span>
                     <strong class="part-name<?= $p['description'] === '' ? ' muted' : '' ?>"><?= h($p['description'] !== '' ? $p['description'] : LOC('lib.no_description')) ?></strong>
