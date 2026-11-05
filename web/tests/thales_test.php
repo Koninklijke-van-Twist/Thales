@@ -147,9 +147,23 @@ $GLOBALS['THALES_MIMIR'] = function (string $table, array $select, string $filte
     }
     if ($table === 'AppWerkorders') {
         $prev = (new DateTimeImmutable('first day of last month'))->format('Y-m-d');
-        if ($top === 1) { // oudste maand bepalen: werkorders vanaf vorige maand
+        // Description-probe / gerichte batch (niet in brede delta/backfill-select)
+        if (in_array('Description', $select, true)) {
+            if ($filter === '') {
+                return [['No' => 'PROBE', 'Description' => '']];
+            }
+            if (preg_match_all("/No eq '([^']+)'/", $filter, $mm)) {
+                $out = [];
+                foreach ($mm[1] as $no) {
+                    $out[] = ['No' => $no, 'Description' => strtoupper($no) === 'WO2600099' ? 'Correctief bij klant' : ''];
+                }
+                return $out;
+            }
+            return [];
+        }
+        if ($top === 1 && str_contains($filter, 'Created_On lt ')) { // oudste maand bepalen
             preg_match('/Created_On lt (\S+)/', $filter, $mm);
-            return $mm[1] > $prev ? [['No' => 'X']] : [];
+            return ($mm[1] ?? '') > $prev ? [['No' => 'X']] : [];
         }
         if (str_contains($filter, ' lt ')) { // backfill op Created_On: één maand
             return str_contains($filter, 'Created_On ge ' . $prev) && $company === 'KvT'
@@ -244,7 +258,7 @@ check(thales_state('workorders_backfill_oldest_month|KvT') === $cur && thales_st
 $hits = thales_workorder_components('wo2600099');
 check(count($hits) === 2 && $hits[0]['company'] === 'HvT' && $hits[0]['component_no'] === '90000001' && $hits[1]['component_no'] === '90000002', 'zelfde nummer in twee bedrijven: beide treffers');
 check(thales_workorder_components('WO2600098')[0]['component_no'] === '' && count(thales_workorder_components('WO2600098')) === 2, 'delta op Start_Date; leeg component bewaard');
-check(thales_workorder_components('WO2600001') === [['company' => '', 'wo_no' => 'WO2600001', 'component_no' => '90000001', 'task_code' => '', 'task_description' => '']], 'werkorder uit rapport als fallback');
+check(thales_workorder_components('WO2600001') === [['company' => '', 'wo_no' => 'WO2600001', 'component_no' => '90000001', 'task_code' => '', 'task_description' => '', 'description' => '']], 'werkorder uit rapport als fallback');
 $sugg = array_column(thales_suggest('wo26'), 'value');
 check(in_array('werkorder HvT,werkorder KvT', array_column(thales_suggest('WO2600099'), 'kind'), true) && in_array('WO2600099', $sugg, true) && in_array('WO2600001', $sugg, true) && array_column(thales_suggest('9000'), 'value') === ['90000001', '90000002', '90000003'], 'autocomplete prefix op werkorders en componenten');
 check(thales_suggest('%') === [] && count(thales_suggest('9', 1)) === 1, 'autocomplete: % letterlijk, limiet');
@@ -343,6 +357,35 @@ check(($sugTask[0] ?? '') === 'TST-1' || ($sugTask[0] ?? '') === 'TST-2', 'sugge
 check(in_array('TST-MOTOR', $sugTask, true), 'suggest met taak: ook motor-only onderdelen');
 
 
+// ---------- WO Description: gericht vullen, bewaren bij sync, suggest/fuzzy
+$db->exec("UPDATE workorders SET description = NULL WHERE wo_no = 'WO2600099'");
+$fill = thales_fill_workorder_descriptions(microtime(true) + 30, gmdate('c', time() - 86400));
+check(str_contains($fill, 'gevuld') || str_contains($fill, 'gezet'), 'description-fill: statusregel');
+$woDesc = thales_workorder_components('WO2600099');
+check(($woDesc[0]['description'] ?? '') === 'Correctief bij klant' || ($woDesc[1]['description'] ?? '') === 'Correctief bij klant', 'description-fill: WO2600099 krijgt Description');
+// Sync mag description niet wissen
+$before = (string) $db->query("SELECT description FROM workorders WHERE company='KvT' AND wo_no='WO2600099'")->fetchColumn();
+thales_store_workorders('KvT', "No eq 'WO2600099'", '2026-11-05');
+$after = (string) $db->query("SELECT description FROM workorders WHERE company='KvT' AND wo_no='WO2600099'")->fetchColumn();
+check($before !== '' && $before === $after, 'description blijft staan na store_workorders');
+$sugDesc = thales_suggest('Correctief bij');
+check(in_array('WO2600099', array_column($sugDesc, 'value'), true), 'suggest fuzzy op WO-description');
+$lab = null;
+foreach ($sugDesc as $row) {
+    if ($row['value'] === 'WO2600099') { $lab = $row['label'] ?? ''; break; }
+}
+check(is_string($lab) && str_contains($lab, 'Correctief bij klant'), 'suggest label toont No · Description');
+// Ontbrekend veld: Ariadne-melding, geen crash
+$GLOBALS['THALES_MIMIR'] = function (string $table, array $select, string $filter, int $top, ?string $company = null): array {
+    if ($table === 'AppWerkorders' && in_array('Description', $select, true)) {
+        throw new RuntimeException('Mímir AppWerkorders HTTP 400: Onbekende kolom: Description');
+    }
+    return [];
+};
+thales_set_state('workorders_description_field', '0');
+$missing = thales_fill_workorder_descriptions(microtime(true) + 10);
+check(str_contains($missing, 'ontbreekt') && str_contains($missing, 'Ariadne'), 'description ontbreekt → Ariadne-melding');
+
 // ---------- schema-upgrade vanaf pre-#15 DB (subprocess: verse static PDO)
 $upgradeDir = sys_get_temp_dir() . '/thales-upgrade-' . getmypid();
 @mkdir($upgradeDir);
@@ -367,7 +410,7 @@ $cmd = escapeshellarg(PHP_BINARY) . ' -r ' . escapeshellarg(
     . 'require ' . var_export(dirname(__DIR__) . '/thales_lib.php', true) . ';'
     . '$db=thales_db();'
     . '$cols=array_column($db->query("PRAGMA table_info(workorders)")->fetchAll(),"name");'
-    . 'if (!in_array("task_code",$cols,true)||!in_array("task_description",$cols,true)) {fwrite(STDERR,"missing cols\n"); exit(1);}'
+    . 'if (!in_array("task_code",$cols,true)||!in_array("task_description",$cols,true)||!in_array("description",$cols,true)) {fwrite(STDERR,"missing cols\n"); exit(1);}'
     . 'if (!$db->query("SELECT 1 FROM sqlite_master WHERE name=\"task_parts\"")->fetchColumn()) {fwrite(STDERR,"no task_parts\n"); exit(1);}'
     . 'if ((string)$db->query("SELECT value FROM state WHERE key=\"schema_version\"")->fetchColumn() !== (string)THALES_SCHEMA_VERSION) {fwrite(STDERR,"bad version\n"); exit(1);}'
     . '$h=thales_workorder_components("WO-OLD");'
@@ -375,7 +418,7 @@ $cmd = escapeshellarg(PHP_BINARY) . ' -r ' . escapeshellarg(
     . 'echo "upgrade-ok\n";'
 );
 exec($cmd, $out, $code);
-check($code === 0 && ($out[0] ?? '') === 'upgrade-ok', 'schema-upgrade vanaf pre-#15 DB (task_code + task_parts)');
+check($code === 0 && ($out[0] ?? '') === 'upgrade-ok', 'schema-upgrade vanaf pre-#15 DB (task_code + task_parts + description)');
 
 // ---------- page-read tijdens write-lock (WAL + busy_timeout): korte exclusive lock, read moet wachten en slagen
 $lockDir = sys_get_temp_dir() . '/thales-lock-' . getmypid();
