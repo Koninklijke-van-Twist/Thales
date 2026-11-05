@@ -189,14 +189,16 @@ if (isset($_GET['partial']) && (string) $_GET['partial'] === '1') {
         .modal-close { background: var(--kvt-main-blue); color: #fff; border-radius: 6px; text-decoration: none; position: absolute; top: 10px; right: 10px; padding: 4px 11px; font-size: 1.2rem; line-height: 1; }
         @media (max-width: 600px) { .modal-overlay { padding: 0; } .modal { max-height: 100vh; height: 100%; border-radius: 0; padding: 12px; } th, td { padding: 5px 6px; } }
 
-        .test-layout { display: grid; grid-template-columns: 1fr minmax(220px, 280px); gap: 16px; align-items: start; }
+        .test-layout { display: grid; grid-template-columns: 1fr minmax(220px, 280px); gap: 16px; align-items: stretch; }
         @media (max-width: 800px) { .test-layout { grid-template-columns: 1fr; } }
-        .nodig-panel { position: sticky; top: 12px; min-height: 180px; }
-        .nodig-panel.drag-over { outline: 2px dashed var(--kvt-main-blue); background: var(--kvt-row-ok); }
+        .nodig-col { align-self: stretch; min-height: 100%; display: flex; flex-direction: column; border-radius: 10px; box-sizing: border-box; }
+        .nodig-col.drag-over { outline: 2px dashed var(--kvt-main-blue); outline-offset: -2px; background: var(--kvt-row-ok); }
+        .nodig-panel { position: sticky; top: 12px; }
         .nodig-list { list-style: none; margin: 8px 0 0; padding: 0; }
-        .nodig-list li { display: flex; gap: 8px; align-items: flex-start; padding: 8px; border: 1px solid var(--kvt-line); border-radius: 6px; margin-bottom: 6px; background: #fff; }
+        .nodig-list li { display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: flex-start; padding: 0 10px 8px; border: 1px solid var(--kvt-line); border-radius: 6px; margin-bottom: 6px; background: #fff; overflow: hidden; position: relative; }
+        .nodig-list .part-bar { display: block; width: calc(100% + 20px); height: 6px; margin: 0 -10px 6px; flex: 0 0 auto; }
         .nodig-list .nodig-meta { flex: 1; min-width: 0; }
-        .nodig-list button { background: transparent; color: var(--kvt-danger); padding: 2px 8px; }
+        .nodig-list button { background: transparent; color: var(--kvt-danger); padding: 2px 8px; margin-left: auto; }
         .odds-card { cursor: grab; position: relative; }
         .odds-card .odds-add { position: absolute; top: 10px; right: 8px; background: var(--kvt-main-blue); color: #fff; border: 0; border-radius: 50%; width: 28px; height: 28px; line-height: 28px; padding: 0; font-size: 1.1rem; }
         .odds-pct { font-size: 1.25rem; font-weight: 700; color: var(--kvt-perkins-blue); }
@@ -386,6 +388,7 @@ if (isset($_GET['partial']) && (string) $_GET['partial'] === '1') {
                      data-item="<?= h($p['item_no']) ?>"
                      data-desc="<?= h($p['description']) ?>"
                      data-qty="<?= h(thales_fmt_qty($p['qty_median'])) ?>"
+                     data-hue="<?= (int) $p['hue'] ?>"
                      data-modal="<?= h($modalQs) ?>">
                     <span class="part-bar" style="background: hsl(<?= (int) $p['hue'] ?>, 55%, 45%);"></span>
                     <button type="button" class="odds-add" title="<?= h(LOC('test.nodig_add')) ?>">+</button>
@@ -418,8 +421,8 @@ if (isset($_GET['partial']) && (string) $_GET['partial'] === '1') {
     <?php endforeach; endif; ?>
     </div>
 
-    <aside class="nodig-panel" id="nodig-panel">
-        <section>
+    <aside class="nodig-col" id="nodig-dropzone">
+        <section class="nodig-panel" id="nodig-panel">
             <h2><?= h(LOC('test.nodig_title')) ?></h2>
             <p class="muted"><?= h(LOC('test.nodig_hint')) ?></p>
             <ul class="nodig-list" id="nodig-list"></ul>
@@ -494,11 +497,29 @@ if (isset($_GET['partial']) && (string) $_GET['partial'] === '1') {
             });
         }
 
-        /* ---- Nodig (localStorage + DnD) ---- */
+        /* ---- Nodig (localStorage + DnD; kolom = dropzone; zelfde part-bar-kleur) ---- */
         var LS = 'thales-nodig-v1';
-        var panel = document.getElementById('nodig-panel');
+        var zone = document.getElementById('nodig-dropzone');
         var ul = document.getElementById('nodig-list');
         var empty = document.getElementById('nodig-empty');
+        function partHue(desc, item) {
+            var key = String(desc || '').trim().toLowerCase().replace(/\s+/g, ' ');
+            if (!key) { key = String(item || '').toUpperCase(); }
+            var crc = 0 ^ (-1);
+            for (var i = 0; i < key.length; i++) {
+                crc = (crc >>> 8) ^ partHue.table[(crc ^ key.charCodeAt(i)) & 0xff];
+            }
+            return ((crc ^ (-1)) >>> 0) % 360;
+        }
+        partHue.table = (function () {
+            var t = [], n, c, k;
+            for (n = 0; n < 256; n++) {
+                c = n;
+                for (k = 0; k < 8; k++) { c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1); }
+                t[n] = c;
+            }
+            return t;
+        })();
         function loadNodig() {
             try { return JSON.parse(localStorage.getItem(LS) || '[]'); } catch (e) { return []; }
         }
@@ -510,8 +531,11 @@ if (isset($_GET['partial']) && (string) $_GET['partial'] === '1') {
             var items = loadNodig();
             ul.innerHTML = '';
             items.forEach(function (it, idx) {
+                var hue = (it.hue !== undefined && it.hue !== null && it.hue !== '') ? parseInt(it.hue, 10) : partHue(it.desc, it.item);
+                if (isNaN(hue)) { hue = partHue(it.desc, it.item); }
                 var li = document.createElement('li');
-                li.innerHTML = '<div class="nodig-meta"><strong></strong><div class="part-no"></div><div class="muted"></div></div>';
+                li.innerHTML = '<span class="part-bar"></span><div class="nodig-meta"><strong></strong><div class="part-no"></div><div class="muted"></div></div>';
+                li.querySelector('.part-bar').style.background = 'hsl(' + (hue % 360) + ', 55%, 45%)';
                 li.querySelector('strong').textContent = it.desc || it.item;
                 li.querySelector('.part-no').textContent = it.item;
                 li.querySelector('.muted').textContent = it.qty ? ('× ' + it.qty) : '';
@@ -529,22 +553,30 @@ if (isset($_GET['partial']) && (string) $_GET['partial'] === '1') {
             });
             empty.hidden = items.length > 0;
         }
-        function addNodig(item, desc, qty) {
+        function addNodig(item, desc, qty, hue) {
             var items = loadNodig();
             if (items.some(function (x) { return x.item === item; })) { return; }
-            items.push({ item: item, desc: desc || '', qty: qty || '' });
+            var h = (hue !== undefined && hue !== null && hue !== '') ? parseInt(hue, 10) : partHue(desc, item);
+            if (isNaN(h)) { h = partHue(desc, item); }
+            items.push({ item: item, desc: desc || '', qty: qty || '', hue: h });
             saveNodig(items);
         }
         renderNodig();
-        if (panel) {
-            panel.addEventListener('dragover', function (e) { e.preventDefault(); panel.classList.add('drag-over'); });
-            panel.addEventListener('dragleave', function () { panel.classList.remove('drag-over'); });
-            panel.addEventListener('drop', function (e) {
+        if (zone) {
+            zone.addEventListener('dragover', function (e) {
                 e.preventDefault();
-                panel.classList.remove('drag-over');
+                e.dataTransfer.dropEffect = 'copy';
+                zone.classList.add('drag-over');
+            });
+            zone.addEventListener('dragleave', function (e) {
+                if (!zone.contains(e.relatedTarget)) { zone.classList.remove('drag-over'); }
+            });
+            zone.addEventListener('drop', function (e) {
+                e.preventDefault();
+                zone.classList.remove('drag-over');
                 try {
                     var data = JSON.parse(e.dataTransfer.getData('application/json') || '{}');
-                    if (data.item) { addNodig(data.item, data.desc, data.qty); }
+                    if (data.item) { addNodig(data.item, data.desc, data.qty, data.hue); }
                 } catch (err) {}
             });
         }
@@ -553,7 +585,8 @@ if (isset($_GET['partial']) && (string) $_GET['partial'] === '1') {
                 e.dataTransfer.setData('application/json', JSON.stringify({
                     item: card.getAttribute('data-item'),
                     desc: card.getAttribute('data-desc'),
-                    qty: card.getAttribute('data-qty')
+                    qty: card.getAttribute('data-qty'),
+                    hue: card.getAttribute('data-hue')
                 }));
                 e.dataTransfer.effectAllowed = 'copy';
             });
@@ -562,7 +595,7 @@ if (isset($_GET['partial']) && (string) $_GET['partial'] === '1') {
                 plus.addEventListener('click', function (e) {
                     e.preventDefault();
                     e.stopPropagation();
-                    addNodig(card.getAttribute('data-item'), card.getAttribute('data-desc'), card.getAttribute('data-qty'));
+                    addNodig(card.getAttribute('data-item'), card.getAttribute('data-desc'), card.getAttribute('data-qty'), card.getAttribute('data-hue'));
                 });
             }
         });
