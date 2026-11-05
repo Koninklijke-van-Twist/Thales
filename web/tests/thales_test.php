@@ -108,6 +108,7 @@ $GLOBALS['THALES_HTTP'] = function (string $method, string $url, array $h, ?stri
     return [404, '{}'];
 };
 // splitsen op leestekens: 'KO' raakt het maximum en alle nummers gaan verder met '-'
+$GLOBALS['thalesBcWorkorder'] = ['companies' => ['KvT', 'HvT']];
 $GLOBALS['THALES_MIMIR'] = function (string $table, array $select, string $filter, int $top): array {
     if ($filter === "startswith(No,'K')" || $filter === "startswith(No,'KO')") { return array_fill(0, THALES_MIMIR_CHUNK, ['No' => 'KO-X']); }
     if ($filter === "startswith(No,'KO-')") { return [['No' => 'KO-1'], ['No' => 'KO-2']]; }
@@ -117,7 +118,7 @@ $seen = [];
 thales_mimir_each('AppItems', ['No'], 'No', '', function (array $row) use (&$seen): void { $seen[] = $row['No']; });
 check($seen === ['KO-1', 'KO-2'], 'mimir_each splitst ook op \'-\' (KO-…)');
 $mimirCalls = 0;
-$GLOBALS['THALES_MIMIR'] = function (string $table, array $select, string $filter, int $top) use (&$mimirCalls): array {
+$GLOBALS['THALES_MIMIR'] = function (string $table, array $select, string $filter, int $top, ?string $company = null) use (&$mimirCalls): array {
     $mimirCalls++;
     if ($top < 1 || $top > 10000) { check(false, 'Mímir top binnen 1..10000'); }
     if ($table === 'AppComponentCard' && str_contains($filter, "'9'")) {
@@ -131,10 +132,17 @@ $GLOBALS['THALES_MIMIR'] = function (string $table, array $select, string $filte
     }
     if ($table === 'AppWerkorders') {
         $prev = (new DateTimeImmutable('first day of last month'))->format('Y-m-d');
-        if (str_contains($filter, ' lt ')) { // backfill: één maand
-            return str_contains($filter, 'ge ' . $prev) ? [['No' => 'WO2500001', 'Component_No' => '90000001', 'Start_Date' => $prev]] : [];
+        if ($top === 1) { // oudste maand bepalen: werkorders vanaf vorige maand
+            preg_match('/Created_On lt (\S+)/', $filter, $mm);
+            return $mm[1] > $prev ? [['No' => 'X']] : [];
         }
-        return [['No' => 'WO2600099', 'Component_No' => '90000002', 'Start_Date' => date('Y-m-d')], ['No' => 'WO2600098', 'Component_No' => '', 'Start_Date' => date('Y-m-d')]];
+        if (str_contains($filter, ' lt ')) { // backfill op Created_On: één maand
+            return str_contains($filter, 'Created_On ge ' . $prev) && $company === 'KvT' ? [['No' => 'WO2500001', 'Component_No' => '90000001', 'Created_On' => $prev, 'Start_Date' => '0001-01-01']] : [];
+        }
+        if (str_starts_with($filter, 'Start_Date')) {
+            return [['No' => 'WO2600098', 'Component_No' => '', 'Created_On' => '2020-01-01', 'Start_Date' => date('Y-m-d')]];
+        }
+        return [['No' => 'WO2600099', 'Component_No' => $company === 'KvT' ? '90000002' : '90000001', 'Created_On' => date('Y-m-d'), 'Start_Date' => '0001-01-01']];
     }
     return [];
 };
@@ -161,9 +169,13 @@ $search = thales_search('startacu', 'PERKINS', '4016TAG2A');
 check(($search['used'][0]['item_no'] ?? '') === 'TST-1' && ($search['other'][0]['item_no'] ?? '') === 'TST-3', 'fuzzy: gebruikt eerst, dan overige (typefout startacu)');
 
 // Werkorders: delta + één maand backfill per nacht
-check(thales_state('workorders_backfill_oldest_month') === (new DateTimeImmutable('first day of last month'))->format('Y-m') && thales_state('workorders_backfill_done') === null, 'backfill: één maand terug, nog niet klaar');
-check(thales_workorder_component('wo2600099') === '90000002' && thales_workorder_component('WO2500001') === '90000001', 'werkorder => component (delta en backfill)');
-check(thales_workorder_component('WO2600001') === '90000001' && thales_workorder_component('WO2600098') === null, 'werkorder uit rapport; leeg component => null');
+$cur = (new DateTimeImmutable('now'))->format('Y-m');
+check(thales_state('workorders_backfill_oldest_month|KvT') === $cur && thales_state('workorders_backfill_end|KvT') === (new DateTimeImmutable('first day of last month'))->format('Y-m')
+    && thales_state('workorders_backfill_done|KvT') === null, 'backfill: eerste nacht huidige maand, eindpunt = oudste Created_On-maand');
+$hits = thales_workorder_components('wo2600099');
+check(count($hits) === 2 && $hits[0]['company'] === 'HvT' && $hits[0]['component_no'] === '90000001' && $hits[1]['component_no'] === '90000002', 'zelfde nummer in twee bedrijven: beide treffers');
+check(thales_workorder_components('WO2600098')[0]['component_no'] === '' && count(thales_workorder_components('WO2600098')) === 2, 'delta op Start_Date; leeg component bewaard');
+check(thales_workorder_components('WO2600001') === [['company' => '', 'wo_no' => 'WO2600001', 'component_no' => '90000001']], 'werkorder uit rapport als fallback');
 $sugg = array_column(thales_suggest('wo26'), 'value');
 check(in_array('WO2600099', $sugg, true) && in_array('WO2600001', $sugg, true) && array_column(thales_suggest('9000'), 'value') === ['90000001', '90000002', '90000003'], 'autocomplete prefix op werkorders en componenten');
 check(thales_suggest('%') === [] && count(thales_suggest('9', 1)) === 1, 'autocomplete: % letterlijk, limiet');
@@ -179,7 +191,7 @@ $db->exec("UPDATE reports SET parse_status = 'processing' WHERE item_id = 'A'");
 $deltaPages = [['value' => [], '@odata.deltaLink' => 'https://g/delta?token=3']];
 thales_nightly(60);
 $a = $db->query("SELECT parse_status, retry_count, first_failed_at FROM reports WHERE item_id = 'A'")->fetch();
-check(thales_state('workorders_backfill_done') === '1', 'backfill klaar na een lege maand');
+check(thales_workorder_components('WO2500001')[0]['component_no'] === '90000001' && thales_state('workorders_backfill_done|KvT') === '1' && thales_state('workorders_backfill_done|HvT') === '1', 'backfill op Created_On, klaar bij oudste maand');
 check($a['parse_status'] === 'ok' && (int) $a['retry_count'] === 0 && $a['first_failed_at'] === null, 'gecrasht rapport via retry-lijst opnieuw verwerkt');
 check(str_contains((string) file_get_contents($GLOBALS['THALES_DATA_DIR'] . '/nightly.log'), 'Rapport: 90000001_20260101_WO2600001_10H_CO_1.xlsx (10 bytes)'), 'naam en grootte gelogd voor download');
 // Een week lang mislukt => given_up, ook een nieuwe wijzigingsdatum zet hem niet terug
