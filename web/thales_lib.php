@@ -42,6 +42,7 @@ const THALES_BC_WORKORDER_DEFAULT = [
     'component' => 'Component_No', // componentnummer; leeg is normaal (8–25%)
     'task_code' => 'Task_Code',           // vaste lijst (Ariadne 05-11-2026)
     'task_description' => 'Task_Description', // vrije tekst; terugval / labels
+    'description' => 'Description', // WO-kopomschrijving; gericht ophalen (niet in brede delta/backfill)
     'created' => 'Created_On',     // altijd gevuld: backfill per maand + delta
     'start' => 'Start_Date',       // tweede delta-query (kan 0001-01-01 zijn)
     'min_date' => '2002-01-01',    // ondergrens backfill
@@ -126,7 +127,7 @@ function thales_data_dir(): string
 }
 
 /** Schema-versie: omhoog bij nieuwe migraties; page load slaat DDL over als DB al bij is. */
-define('THALES_SCHEMA_VERSION', '3');
+define('THALES_SCHEMA_VERSION', '4');
 
 function thales_db(): PDO
 {
@@ -177,7 +178,7 @@ CREATE TABLE IF NOT EXISTS components (component_no TEXT PRIMARY KEY, parent_no 
 CREATE INDEX IF NOT EXISTS comp_parent ON components(parent_no);
 CREATE TABLE IF NOT EXISTS report_motor (item_id TEXT PRIMARY KEY, component_no TEXT, brand_key TEXT, brand TEXT,
     type_key TEXT, type TEXT, brand_source TEXT);
-CREATE TABLE IF NOT EXISTS workorders (company TEXT NOT NULL, wo_no TEXT NOT NULL, component_no TEXT, task_code TEXT NOT NULL DEFAULT '', task_description TEXT NOT NULL DEFAULT '', created_on TEXT, start_date TEXT, synced_at TEXT,
+CREATE TABLE IF NOT EXISTS workorders (company TEXT NOT NULL, wo_no TEXT NOT NULL, component_no TEXT, task_code TEXT NOT NULL DEFAULT '', task_description TEXT NOT NULL DEFAULT '', description TEXT, created_on TEXT, start_date TEXT, synced_at TEXT,
     PRIMARY KEY (company, wo_no));
 CREATE INDEX IF NOT EXISTS wo_no ON workorders(wo_no);
 CREATE TABLE IF NOT EXISTS items (item_no TEXT PRIMARY KEY, description TEXT, excel_name TEXT NOT NULL DEFAULT '', bc_type TEXT NOT NULL DEFAULT '', is_task INTEGER NOT NULL DEFAULT 0, search TEXT, synced_at TEXT);
@@ -233,6 +234,11 @@ function thales_migrate(PDO $pdo): void
             $pdo->prepare('DELETE FROM state WHERE key = ?')->execute(['workorders_taskfill_done|' . $co]);
             $pdo->prepare('DELETE FROM state WHERE key = ?')->execute(['workorders_taskfill_oldest_month|' . $co]);
         }
+    }
+    // WO-kop Description: NULL = nog niet opgezocht; '' = opgezocht zonder tekst. Vóór indexen (zie PR #15).
+    if (!in_array('description', $woCols, true)) {
+        $pdo->exec('ALTER TABLE workorders ADD COLUMN description TEXT');
+        $woCols[] = 'description';
     }
     $pdo->exec('CREATE INDEX IF NOT EXISTS wo_task ON workorders(task_code)');
     $pdo->exec("CREATE TABLE IF NOT EXISTS task_parts (
@@ -888,8 +894,16 @@ function thales_bc_workorder_config(): array
 function thales_store_workorders(string $company, string $filter, string $today): int
 {
     $cfg = thales_bc_workorder_config();
+    // Geen Description in $select: die komt gericht via thales_fill_workorder_descriptions.
     $select = [$cfg['key'], $cfg['component'], $cfg['task_code'], $cfg['task_description'], $cfg['created'], $cfg['start']];
-    $ins = thales_db()->prepare('INSERT OR REPLACE INTO workorders(company, wo_no, component_no, task_code, task_description, created_on, start_date, synced_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?)');
+    $ins = thales_db()->prepare('INSERT INTO workorders(company, wo_no, component_no, task_code, task_description, created_on, start_date, synced_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(company, wo_no) DO UPDATE SET
+            component_no = excluded.component_no,
+            task_code = excluded.task_code,
+            task_description = excluded.task_description,
+            created_on = excluded.created_on,
+            start_date = excluded.start_date,
+            synced_at = excluded.synced_at');
     $onRow = static function (array $row) use ($ins, $cfg, $today, $company): void {
         $no = strtoupper(trim((string) ($row[$cfg['key']] ?? '')));
         if ($no !== '') {
@@ -1005,18 +1019,141 @@ function thales_sync_workorders(): string
 }
 
 /**
+ * Of AppWerkorders.Description (of geconfigureerde naam) in Mímir bestaat. State:
+ * workorders_description_field = 1|0. Bij 0 elke nacht opnieuw proberen (zodra Ariadne het veld
+ * publiceert, vult de gerichte pass vanzelf).
+ */
+function thales_workorder_description_field_available(): bool
+{
+    $cfg = thales_bc_workorder_config();
+    $field = (string) ($cfg['description'] ?? 'Description');
+    $cached = thales_state('workorders_description_field');
+    if ($cached === '1') {
+        return true;
+    }
+    $company = (string) (($cfg['companies'][0] ?? null) ?: 'Koninklijke van Twist');
+    try {
+        thales_mimir_query((string) $cfg['entity'], [(string) $cfg['key'], $field], '', 1, $company);
+        thales_set_state('workorders_description_field', '1');
+        return true;
+    } catch (Throwable $e) {
+        $msg = $e->getMessage();
+        if (stripos($msg, 'Onbekende kolom') !== false || stripos($msg, $field) !== false) {
+            thales_set_state('workorders_description_field', '0');
+            return false;
+        }
+        // Transient Mímir/netwerkfout: niet permanent op 0 zetten.
+        throw $e;
+    }
+}
+
+/**
+ * Description gericht ophalen: (a) WOs op rapporten van deze run, (b) cache-rijen met description IS NULL.
+ * Batches per bedrijf op No; binnen budget. Lege/missende treffers → description '' (niet opnieuw).
+ * Description zit níet in de brede delta/backfill-$select.
+ */
+function thales_fill_workorder_descriptions(float $deadline, ?string $runSinceIso = null): string
+{
+    $cfg = thales_bc_workorder_config();
+    $field = (string) ($cfg['description'] ?? 'Description');
+    try {
+        if (!thales_workorder_description_field_available()) {
+            $msg = 'AppWerkorders heeft geen veld ' . $field . ' in Mímir (KvT/HvT). Ariadne moet Description aan de webservice toevoegen; daarna vult Thales vanzelf.';
+            thales_log($msg);
+            return 'veld ' . $field . ' ontbreekt (Ariadne)';
+        }
+    } catch (Throwable $e) {
+        thales_log('WO-description probe: ' . $e->getMessage());
+        return 'probe-fout: ' . $e->getMessage();
+    }
+
+    $db = thales_db();
+    $batchSize = 40;
+    $filled = 0;
+    $checked = 0;
+    $since = $runSinceIso ?? gmdate('c', time() - 6 * 3600);
+    $out = [];
+
+    foreach ((array) $cfg['companies'] as $company) {
+        $company = (string) $company;
+        if (microtime(true) >= $deadline) {
+            $out[] = $company . ': budget';
+            break;
+        }
+        $stmt = $db->prepare("SELECT DISTINCT w.wo_no FROM workorders w
+            LEFT JOIN reports r ON UPPER(TRIM(COALESCE(r.wo, ''))) = w.wo_no AND r.processed_at >= ?
+            WHERE w.company = ? AND w.description IS NULL
+            ORDER BY CASE WHEN r.wo IS NOT NULL THEN 0 ELSE 1 END, w.wo_no");
+        $stmt->execute([$since, $company]);
+        $nos = [];
+        foreach ($stmt->fetchAll() as $r) {
+            $n = strtoupper(trim((string) $r['wo_no']));
+            if ($n !== '') {
+                $nos[] = $n;
+            }
+        }
+        if ($nos === []) {
+            $out[] = $company . ': 0';
+            continue;
+        }
+        $upd = $db->prepare('UPDATE workorders SET description = ? WHERE company = ? AND wo_no = ? AND description IS NULL');
+        $coFilled = 0;
+        $coChecked = 0;
+        while ($nos !== []) {
+            if (microtime(true) >= $deadline) {
+                break;
+            }
+            $batch = array_splice($nos, 0, $batchSize);
+            $filter = implode(' or ', array_map(static fn(string $n): string => $cfg['key'] . ' eq ' . thales_odata_quote($n), $batch));
+            try {
+                $rows = thales_mimir_query((string) $cfg['entity'], [(string) $cfg['key'], $field], $filter, max($batchSize, count($batch)), $company);
+            } catch (Throwable $e) {
+                thales_log('WO-description ' . $company . ': ' . $e->getMessage());
+                $out[] = $company . ': fout ' . $e->getMessage();
+                break;
+            }
+            $byNo = [];
+            foreach ($rows as $row) {
+                $no = strtoupper(trim((string) ($row[$cfg['key']] ?? '')));
+                if ($no !== '') {
+                    $byNo[$no] = trim((string) ($row[$field] ?? ''));
+                }
+            }
+            foreach ($batch as $no) {
+                $desc = $byNo[$no] ?? '';
+                $upd->execute([$desc, $company, $no]);
+                $coChecked++;
+                $checked++;
+                if ($desc !== '') {
+                    $coFilled++;
+                    $filled++;
+                }
+            }
+        }
+        $left = count($nos);
+        $out[] = $company . ': ' . $coFilled . ' gevuld / ' . $coChecked . ' gezet' . ($left > 0 ? ' (nog ' . $left . ')' : '');
+    }
+
+    $total = (int) $db->query('SELECT COUNT(*) FROM workorders')->fetchColumn();
+    $with = (int) $db->query("SELECT COUNT(*) FROM workorders WHERE description IS NOT NULL AND TRIM(description) != ''")->fetchColumn();
+    $sought = (int) $db->query('SELECT COUNT(*) FROM workorders WHERE description IS NOT NULL')->fetchColumn();
+    $pct = $total > 0 ? (int) round(100 * $with / $total) : 0;
+    return implode('; ', $out) . " · vulgraad {$with}/{$total} ({$pct}%, gezet {$sought})";
+}
+
+/**
  * Werkorder => component(en), per bedrijf (hetzelfde nummer kan in meerdere bedrijven bestaan).
  * Fallback: servicerapport (reports.wo). component_no '' = werkorder zonder component.
- * @return list<array{company:string,wo_no:string,component_no:string}>
+ * @return list<array{company:string,wo_no:string,component_no:string,task_code:string,task_description:string,description:string}>
  */
 function thales_workorder_components(string $woNo): array
 {
     $no = strtoupper(trim($woNo));
-    $stmt = thales_db()->prepare('SELECT company, wo_no, component_no, task_code, task_description FROM workorders WHERE wo_no = ? ORDER BY company');
+    $stmt = thales_db()->prepare('SELECT company, wo_no, component_no, task_code, task_description, description FROM workorders WHERE wo_no = ? ORDER BY company');
     $stmt->execute([$no]);
     $hits = $stmt->fetchAll();
     if ($hits === []) {
-        $stmt = thales_db()->prepare("SELECT '' company, UPPER(wo) wo_no, UPPER(equipment_no) component_no, '' task_code, '' task_description FROM reports
+        $stmt = thales_db()->prepare("SELECT '' company, UPPER(wo) wo_no, UPPER(equipment_no) component_no, '' task_code, '' task_description, '' description FROM reports
             WHERE UPPER(wo) = ? AND COALESCE(equipment_no, '') <> '' ORDER BY report_date DESC LIMIT 1");
         $stmt->execute([$no]);
         $hits = $stmt->fetchAll();
@@ -1027,8 +1164,10 @@ function thales_workorder_components(string $woNo): array
         'component_no' => (string) $h['component_no'],
         'task_code' => (string) ($h['task_code'] ?? ''),
         'task_description' => (string) ($h['task_description'] ?? ''),
+        'description' => (string) ($h['description'] ?? ''),
     ], $hits);
 }
+
 
 /**
  * Autocomplete: bekende componenten en werkorders uit de eigen cache, prefix-match.
@@ -1046,9 +1185,48 @@ function thales_suggest(string $prefix, int $limit = 20): array
         UNION SELECT component_no, 'component' FROM report_components WHERE component_no LIKE :p ESCAPE '\\'
         UNION SELECT wo_no, 'werkorder ' || company FROM workorders WHERE wo_no LIKE :p ESCAPE '\\'
         UNION SELECT UPPER(wo), 'werkorder' FROM reports WHERE UPPER(wo) LIKE :p ESCAPE '\\'
-    ) GROUP BY value ORDER BY value LIMIT " . max(1, $limit));
+    ) GROUP BY value ORDER BY value LIMIT " . max(1, min(50, $limit * 3)));
     $stmt->execute([':p' => $like]);
-    return $stmt->fetchAll();
+    $byValue = [];
+    foreach ($stmt->fetchAll() as $row) {
+        $byValue[(string) $row['value']] = ['value' => (string) $row['value'], 'kind' => (string) $row['kind'], 'label' => (string) $row['value'], 'score' => 1.0];
+    }
+    // Fuzzy / substring op WO-description (en label = No · Description).
+    $descRows = thales_db()->query("SELECT wo_no, company, description FROM workorders WHERE description IS NOT NULL AND TRIM(description) != ''")->fetchAll();
+    $q = trim($prefix);
+    foreach ($descRows as $row) {
+        $no = (string) $row['wo_no'];
+        $desc = trim((string) $row['description']);
+        $hay = strtoupper($no . ' ' . $desc);
+        $score = 0.0;
+        if (str_starts_with(strtoupper($no), $p)) {
+            $score = 1.0;
+        } else {
+            $score = thales_fuzzy_score($q, $hay);
+            if ($score < 0.5 && str_contains($hay, $p)) {
+                $score = 0.7;
+            }
+        }
+        if ($score < 0.5) {
+            continue;
+        }
+        $kind = 'werkorder ' . (string) $row['company'];
+        $label = $no . ' · ' . $desc;
+        if (!isset($byValue[$no]) || $score > (float) $byValue[$no]['score']) {
+            $byValue[$no] = ['value' => $no, 'kind' => $kind, 'label' => $label, 'score' => $score];
+        } else {
+            // Prefix-treffer: verrijk label met description.
+            if ($desc !== '' && !str_contains((string) $byValue[$no]['label'], ' · ')) {
+                $byValue[$no]['label'] = $label;
+            }
+            if (!str_contains((string) $byValue[$no]['kind'], $kind)) {
+                $byValue[$no]['kind'] = trim((string) $byValue[$no]['kind'] . ',' . $kind, ',');
+            }
+        }
+    }
+    $out = array_values($byValue);
+    usort($out, static fn($a, $b): int => [$b['score'], $a['value']] <=> [$a['score'], $b['value']]);
+    return array_map(static fn($r) => ['value' => $r['value'], 'kind' => $r['kind'], 'label' => $r['label']], array_slice($out, 0, max(1, $limit)));
 }
 
 /* ---------------------------------------------------------------- aggregaten */
@@ -1401,6 +1579,15 @@ function thales_nightly(?int $budgetSeconds = null): array
         $deltaDone = thales_sync_delta($deadline);
         thales_progress('SharePoint-delta ' . ($deltaDone ? 'compleet' : 'nog niet compleet (gaat volgende run verder)'));
         $pendingDone = thales_process_pending($deadline, $summary);
+        // WO-Description gericht (rapporten deze run + cache zonder description); niet in brede $select.
+        try {
+            $runSince = gmdate('c', (int) $start);
+            thales_progress('WO-descriptions bijwerken');
+            $summary['wo_descriptions'] = thales_fill_workorder_descriptions($deadline, $runSince);
+        } catch (Throwable $e) {
+            $summary['wo_descriptions'] = 'fout: ' . $e->getMessage();
+            thales_log('WO-descriptions: ' . $e->getMessage());
+        }
         thales_rebuild_aggregates();
         if ($deltaDone && $pendingDone) {
             thales_set_state('day_index', $today);

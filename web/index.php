@@ -372,7 +372,10 @@ if (isset($_GET['partial']) && (string) $_GET['partial'] === '1') {
                 <ul class="ac-menu" id="task-ac" role="listbox" hidden></ul></span></label>
             <button type="submit"><?= h(LOC('test.lookup')) ?></button>
             <?php if ($component !== '' && $lookup === null && $woHits === []): ?><p class="muted"><?= h(LOC('test.unknown')) ?></p><?php endif; ?>
-            <?php foreach ($woHits as $hit): $wo = $hit['wo_no'] . ($hit['company'] !== '' ? ' (' . $hit['company'] . ')' : ''); ?>
+            <?php foreach ($woHits as $hit):
+                $wo = $hit['wo_no'] . (trim((string) ($hit['description'] ?? '')) !== '' ? ' · ' . $hit['description'] : '')
+                    . ($hit['company'] !== '' ? ' (' . $hit['company'] . ')' : '');
+            ?>
                 <p><?php if ($hit['component_no'] === ''): ?><?= h(LOC('test.wo_no_component', $wo)) ?>
                 <?php elseif ($hit['lookup'] === null): ?><?= h(LOC('test.wo', $wo, $hit['component_no'])) ?><br><span class="muted"><?= h(LOC('test.unknown')) ?></span>
                 <?php else: $m = $hit['lookup']['motor']; ?><?= h(LOC('test.wo', $wo, $hit['component_no'])) ?>
@@ -594,7 +597,7 @@ if (isset($_GET['partial']) && (string) $_GET['partial'] === '1') {
         bindSuggest(document.getElementById('component-input'), document.getElementById('component-ac'), {
             minLen: 2,
             url: function (q) { return '?suggest=' + encodeURIComponent(q); },
-            mapRow: function (row) { return { value: row.value, label: row.value, sub: row.kind || '' }; }
+            mapRow: function (row) { return { value: row.value, label: row.label || row.value, sub: row.kind || '' }; }
         });
         bindSuggest(document.getElementById('task-input'), document.getElementById('task-ac'), {
             minLen: 1,
