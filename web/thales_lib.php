@@ -125,6 +125,9 @@ function thales_data_dir(): string
     return $dir;
 }
 
+/** Schema-versie: omhoog bij nieuwe migraties; page load slaat DDL over als DB al bij is. */
+define('THALES_SCHEMA_VERSION', '3');
+
 function thales_db(): PDO
 {
     static $pdo = null, $path = null;
@@ -134,7 +137,23 @@ function thales_db(): PDO
     }
     $path = $want;
     $pdo = new PDO('sqlite:' . $want, null, null, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION, PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC]);
-    $pdo->exec('PRAGMA journal_mode=WAL; PRAGMA busy_timeout=10000; PRAGMA foreign_keys=ON;');
+    // busy_timeout vóór andere writes: page load mag niet hard falen tijdens een lange nightly.
+    $pdo->exec('PRAGMA busy_timeout=60000');
+    $pdo->exec('PRAGMA journal_mode=WAL');
+    $pdo->exec('PRAGMA foreign_keys=ON');
+    // Skip DDL als schema al bij is (alleen reads tijdens een lange nightly-transactie).
+    $schemaOk = false;
+    try {
+        $ver = $pdo->query("SELECT value FROM state WHERE key = 'schema_version'")->fetchColumn();
+        $schemaOk = $ver !== false && (string) $ver === (string) THALES_SCHEMA_VERSION;
+    } catch (Throwable $e) {
+        $schemaOk = false;
+    }
+    if ($schemaOk) {
+        return $pdo;
+    }
+    // Geen index op task_code hier: oude DBs hebben die kolom nog niet (CREATE TABLE IF NOT EXISTS
+    // laat de bestaande workorders-tabel onaangeroerd). Index + kolommen komen in thales_migrate().
     $pdo->exec(<<<SQL
 CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS folders (id TEXT PRIMARY KEY, name TEXT, parent_id TEXT);
@@ -161,23 +180,14 @@ CREATE TABLE IF NOT EXISTS report_motor (item_id TEXT PRIMARY KEY, component_no 
 CREATE TABLE IF NOT EXISTS workorders (company TEXT NOT NULL, wo_no TEXT NOT NULL, component_no TEXT, task_code TEXT NOT NULL DEFAULT '', task_description TEXT NOT NULL DEFAULT '', created_on TEXT, start_date TEXT, synced_at TEXT,
     PRIMARY KEY (company, wo_no));
 CREATE INDEX IF NOT EXISTS wo_no ON workorders(wo_no);
-CREATE INDEX IF NOT EXISTS wo_task ON workorders(task_code);
 CREATE TABLE IF NOT EXISTS items (item_no TEXT PRIMARY KEY, description TEXT, excel_name TEXT NOT NULL DEFAULT '', bc_type TEXT NOT NULL DEFAULT '', is_task INTEGER NOT NULL DEFAULT 0, search TEXT, synced_at TEXT);
 CREATE TABLE IF NOT EXISTS usage (
     brand_key TEXT, brand TEXT, type_key TEXT, type TEXT, brand_source TEXT, item_no TEXT, times_used INTEGER, qty_total REAL,
     PRIMARY KEY (brand_key, type_key, item_no));
 CREATE TABLE IF NOT EXISTS resources (resource_no TEXT PRIMARY KEY, name TEXT, synced_at TEXT);
-CREATE TABLE IF NOT EXISTS task_parts (
-    company TEXT NOT NULL, wo_no TEXT NOT NULL, task_code TEXT NOT NULL,
-    brand_key TEXT NOT NULL DEFAULT '', type_key TEXT NOT NULL DEFAULT '',
-    item_no TEXT NOT NULL, qty REAL NOT NULL DEFAULT 0,
-    PRIMARY KEY (company, wo_no, item_no));
-CREATE INDEX IF NOT EXISTS tp_task_motor ON task_parts(task_code, brand_key, type_key);
-CREATE TABLE IF NOT EXISTS task_code_labels (
-    task_code TEXT NOT NULL, description TEXT NOT NULL, times INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (task_code, description));
 SQL);
     thales_migrate($pdo);
+    $pdo->prepare('INSERT OR REPLACE INTO state(key, value) VALUES(?, ?)')->execute(['schema_version', (string) THALES_SCHEMA_VERSION]);
     return $pdo;
 }
 
@@ -208,9 +218,16 @@ function thales_migrate(PDO $pdo): void
         PRIMARY KEY (item_no, name))');
     $pdo->exec('CREATE TABLE IF NOT EXISTS resources (resource_no TEXT PRIMARY KEY, name TEXT, synced_at TEXT)');
     $woCols = array_column($pdo->query('PRAGMA table_info(workorders)')->fetchAll(), 'name');
+    $addedTaskCols = false;
     if (!in_array('task_code', $woCols, true)) {
         $pdo->exec("ALTER TABLE workorders ADD COLUMN task_code TEXT NOT NULL DEFAULT ''");
+        $addedTaskCols = true;
+    }
+    if (!in_array('task_description', $woCols, true)) {
         $pdo->exec("ALTER TABLE workorders ADD COLUMN task_description TEXT NOT NULL DEFAULT ''");
+        $addedTaskCols = true;
+    }
+    if ($addedTaskCols) {
         // Eenmalige her-lees van Task_Code/Description, verdeeld over nachten (zelfde maand-patroon).
         foreach ($pdo->query("SELECT DISTINCT company FROM workorders")->fetchAll(PDO::FETCH_COLUMN) as $co) {
             $pdo->prepare('DELETE FROM state WHERE key = ?')->execute(['workorders_taskfill_done|' . $co]);
