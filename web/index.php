@@ -121,7 +121,9 @@ $motorText = static fn(array $m): string => LOC('test.brand') . ': ' . (trim((st
     . ' · ' . LOC('test.type') . ': ' . (trim((string) $m['type']) !== '' ? $m['type'] : $unknown);
 $motorBrand = (string) ($lookup['motor']['brand_key'] ?? '');
 $motorType = (string) ($lookup['motor']['type_key'] ?? '');
-$taskOdds = $tab === 'test' && $taskCode !== '' ? thales_task_odds($taskCode, $motorBrand, $motorType) : null;
+$taskOdds = $tab === 'test' && $taskCode !== '' && $motorBrand !== '' && $motorType !== ''
+    ? thales_task_odds($taskCode, $motorBrand, $motorType)
+    : null;
 $results = null;
 if ($tab === 'test' && ($query !== '' || ($lookup && $taskCode === ''))) {
     $results = thales_search($query, $motorBrand, $motorType, 50, $taskCode);
@@ -203,9 +205,14 @@ if (isset($_GET['partial']) && (string) $_GET['partial'] === '1') {
         .nodig-list li { display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: flex-start; padding: 0 10px 8px; border: 1px solid var(--kvt-line); border-radius: 6px; margin-bottom: 6px; background: #fff; overflow: hidden; position: relative; }
         .nodig-list .part-bar { display: block; width: calc(100% + 20px); height: 6px; margin: 0 -10px 6px; flex: 0 0 auto; }
         .nodig-list .nodig-meta { flex: 1; min-width: 0; }
-        .nodig-list button { background: transparent; color: var(--kvt-danger); padding: 2px 8px; margin-left: auto; }
+        .nodig-list button.nodig-remove { background: transparent; color: var(--kvt-danger); padding: 2px 8px; margin-left: auto; }
+        .nodig-list .nodig-qty-wrap { display: flex; align-items: center; gap: 4px; margin-left: auto; }
+        .nodig-list .nodig-qty { width: 4.5rem; padding: 2px 4px; }
         .odds-card { cursor: grab; position: relative; }
-        .odds-card .odds-add { position: absolute; top: 10px; right: 8px; background: var(--kvt-main-blue); color: #fff; border: 0; border-radius: 50%; width: 28px; height: 28px; line-height: 28px; padding: 0; font-size: 1.1rem; }
+        .odds-card .odds-add { position: absolute; top: 10px; right: 8px; background: var(--kvt-main-blue); color: #fff; border: 0; border-radius: 50%; width: 28px; height: 28px; line-height: 28px; padding: 0; font-size: 1.1rem; z-index: 2; }
+        .odds-qty-pop { position: absolute; top: 42px; right: 8px; z-index: 6; background: #fff; border: 1px solid var(--kvt-line); border-radius: 8px; padding: 8px; box-shadow: 0 4px 12px rgba(0,0,0,.15); display: flex; gap: 6px; align-items: center; }
+        .odds-qty-pop input { width: 4.5rem; padding: 4px 6px; }
+        .odds-qty-pop button { padding: 4px 10px; border-radius: 6px; }
         .odds-pct { font-size: 1.25rem; font-weight: 700; color: var(--kvt-perkins-blue); }
         form.test-form label { display: inline-block; margin-right: 12px; margin-bottom: 8px; vertical-align: top; }
         .ac-wrap { position: relative; display: inline-block; }
@@ -387,10 +394,27 @@ if (isset($_GET['partial']) && (string) $_GET['partial'] === '1') {
     <?php if ($taskOdds !== null): ?>
     <section>
         <h2><?= h(LOC('test.odds_title')) ?><?php if ($taskCode !== ''): ?> · <?= h(thales_task_label($taskCode)) ?><?php endif; ?></h2>
+        <?php
+            $motorLabel = trim($motorBrand . ' ' . $motorType);
+            if ($lookup) {
+                $mb = trim((string) ($lookup['motor']['brand'] ?? ''));
+                $mt = trim((string) ($lookup['motor']['type'] ?? ''));
+                if ($mb !== '' && ($lookup['motor']['brand_key'] ?? '') !== '?') {
+                    $motorLabel = trim($mb . ' ' . ($mt !== '' ? $mt : $motorType));
+                } elseif ($mt !== '') {
+                    $motorLabel = trim($motorBrand . ' ' . $mt);
+                }
+            }
+        ?>
         <?php if ($taskOdds['tasks'] === 0): ?>
-            <p class="muted"><?= h(LOC('test.odds_none')) ?></p>
+            <p class="muted"><?= h(LOC('test.odds_none', $taskCode, $motorLabel)) ?></p>
         <?php else: ?>
-            <p class="muted"><?= h(LOC($taskOdds['level'] === 'motor+task' ? 'test.odds_level_motor' : 'test.odds_level_task', $taskOdds['tasks'])) ?></p>
+            <p class="muted"><?= h(LOC(
+                $taskOdds['level'] === 'low' ? 'test.odds_level_low' : 'test.odds_level_motor',
+                $taskOdds['tasks'],
+                $taskCode,
+                $motorLabel
+            )) ?></p>
             <div class="part-grid" id="odds-grid">
             <?php foreach ($taskOdds['parts'] as $p):
                 $modalQs = http_build_query(array_filter([
@@ -562,11 +586,15 @@ if (isset($_GET['partial']) && (string) $_GET['partial'] === '1') {
             mapRow: function (row) { return { value: row.value, label: row.label || row.value, sub: '' }; }
         });
 
-        /* ---- Nodig (localStorage + DnD; kolom = dropzone; zelfde part-bar-kleur) ---- */
-        var LS = 'thales-nodig-v1';
+        /* ---- Nodig (localStorage per component + DnD; kolom = dropzone) ---- */
+        var componentJs = <?= json_encode($component, JSON_UNESCAPED_UNICODE) ?>;
+        var LS = 'thales-nodig-v2:' + (componentJs || '_');
         var zone = document.getElementById('nodig-dropzone');
         var ul = document.getElementById('nodig-list');
         var empty = document.getElementById('nodig-empty');
+        var nodigConfirm = <?= json_encode(LOC('test.nodig_confirm'), JSON_UNESCAPED_UNICODE) ?>;
+        var nodigQtyLabel = <?= json_encode(LOC('test.nodig_qty'), JSON_UNESCAPED_UNICODE) ?>;
+        var nodigRemove = <?= json_encode(LOC('test.nodig_remove'), JSON_UNESCAPED_UNICODE) ?>;
         function partHue(desc, item) {
             var key = String(desc || '').trim().toLowerCase().replace(/\s+/g, ' ');
             if (!key) { key = String(item || '').toUpperCase(); }
@@ -585,6 +613,18 @@ if (isset($_GET['partial']) && (string) $_GET['partial'] === '1') {
             }
             return t;
         })();
+        function parseQty(v) {
+            if (v === null || v === undefined) { return 0; }
+            var s = String(v).trim().replace(',', '.');
+            if (s === '') { return 0; }
+            var n = parseFloat(s);
+            return isNaN(n) ? 0 : n;
+        }
+        function fmtQty(n) {
+            if (!isFinite(n) || n === 0) { return ''; }
+            var r = Math.round(n * 1000) / 1000;
+            return String(r);
+        }
         function loadNodig() {
             try { return JSON.parse(localStorage.getItem(LS) || '[]'); } catch (e) { return []; }
         }
@@ -599,34 +639,111 @@ if (isset($_GET['partial']) && (string) $_GET['partial'] === '1') {
                 var hue = (it.hue !== undefined && it.hue !== null && it.hue !== '') ? parseInt(it.hue, 10) : partHue(it.desc, it.item);
                 if (isNaN(hue)) { hue = partHue(it.desc, it.item); }
                 var li = document.createElement('li');
-                li.innerHTML = '<span class="part-bar"></span><div class="nodig-meta"><strong></strong><div class="part-no"></div><div class="muted"></div></div>';
+                li.innerHTML = '<span class="part-bar"></span><div class="nodig-meta"><strong></strong><div class="part-no"></div></div>';
                 li.querySelector('.part-bar').style.background = 'hsl(' + (hue % 360) + ', 55%, 45%)';
                 li.querySelector('strong').textContent = it.desc || it.item;
                 li.querySelector('.part-no').textContent = it.item;
-                li.querySelector('.muted').textContent = it.qty ? ('× ' + it.qty) : '';
+                var qtyWrap = document.createElement('div');
+                qtyWrap.className = 'nodig-qty-wrap';
+                var inp = document.createElement('input');
+                inp.type = 'number';
+                inp.step = 'any';
+                inp.min = '0';
+                inp.className = 'nodig-qty';
+                inp.setAttribute('aria-label', nodigQtyLabel);
+                inp.value = (it.qty !== undefined && it.qty !== null && it.qty !== '') ? it.qty : '';
+                inp.addEventListener('change', function () {
+                    var next = loadNodig();
+                    var v = String(inp.value).trim();
+                    if (v === '' || parseQty(v) === 0) {
+                        next.splice(idx, 1);
+                    } else {
+                        next[idx].qty = fmtQty(parseQty(v));
+                    }
+                    saveNodig(next);
+                });
+                qtyWrap.appendChild(inp);
                 var btn = document.createElement('button');
                 btn.type = 'button';
+                btn.className = 'nodig-remove';
                 btn.textContent = '×';
-                btn.title = <?= json_encode(LOC('test.nodig_remove'), JSON_UNESCAPED_UNICODE) ?>;
+                btn.title = nodigRemove;
                 btn.addEventListener('click', function () {
                     var next = loadNodig();
                     next.splice(idx, 1);
                     saveNodig(next);
                 });
-                li.appendChild(btn);
+                qtyWrap.appendChild(btn);
+                li.appendChild(qtyWrap);
                 ul.appendChild(li);
             });
             empty.hidden = items.length > 0;
         }
         function addNodig(item, desc, qty, hue) {
+            if (!item) { return; }
             var items = loadNodig();
-            if (items.some(function (x) { return x.item === item; })) { return; }
+            var add = parseQty(qty);
             var h = (hue !== undefined && hue !== null && hue !== '') ? parseInt(hue, 10) : partHue(desc, item);
             if (isNaN(h)) { h = partHue(desc, item); }
-            items.push({ item: item, desc: desc || '', qty: qty || '', hue: h });
+            var found = -1;
+            for (var i = 0; i < items.length; i++) {
+                if (items[i].item === item) { found = i; break; }
+            }
+            if (found >= 0) {
+                items[found].qty = fmtQty(parseQty(items[found].qty) + add);
+                if (desc) { items[found].desc = desc; }
+                items[found].hue = h;
+                if (parseQty(items[found].qty) === 0) { items.splice(found, 1); }
+            } else {
+                items.push({ item: item, desc: desc || '', qty: fmtQty(add) || '', hue: h });
+            }
             saveNodig(items);
         }
+        function closeQtyPops(except) {
+            document.querySelectorAll('.odds-qty-pop').forEach(function (el) {
+                if (el !== except) { el.remove(); }
+            });
+        }
+        function openQtyPop(card) {
+            closeQtyPops();
+            var pop = document.createElement('div');
+            pop.className = 'odds-qty-pop';
+            pop.addEventListener('click', function (e) { e.stopPropagation(); });
+            var pin = document.createElement('input');
+            pin.type = 'number';
+            pin.step = 'any';
+            pin.min = '0';
+            pin.setAttribute('aria-label', nodigQtyLabel);
+            pin.value = card.getAttribute('data-qty') || '';
+            var btn = document.createElement('button');
+            btn.type = 'button';
+            btn.textContent = nodigConfirm;
+            function commit() {
+                addNodig(
+                    card.getAttribute('data-item'),
+                    card.getAttribute('data-desc'),
+                    pin.value,
+                    card.getAttribute('data-hue')
+                );
+                pop.remove();
+            }
+            btn.addEventListener('click', function (e) {
+                e.preventDefault();
+                e.stopPropagation();
+                commit();
+            });
+            pin.addEventListener('keydown', function (e) {
+                if (e.key === 'Enter') { e.preventDefault(); commit(); }
+                if (e.key === 'Escape') { e.preventDefault(); pop.remove(); }
+            });
+            pop.appendChild(pin);
+            pop.appendChild(btn);
+            card.appendChild(pop);
+            pin.focus();
+            pin.select();
+        }
         renderNodig();
+        document.addEventListener('click', function () { closeQtyPops(); });
         if (zone) {
             zone.addEventListener('dragover', function (e) {
                 e.preventDefault();
@@ -647,6 +764,7 @@ if (isset($_GET['partial']) && (string) $_GET['partial'] === '1') {
         }
         document.querySelectorAll('.odds-card').forEach(function (card) {
             card.addEventListener('dragstart', function (e) {
+                closeQtyPops();
                 e.dataTransfer.setData('application/json', JSON.stringify({
                     item: card.getAttribute('data-item'),
                     desc: card.getAttribute('data-desc'),
@@ -660,7 +778,7 @@ if (isset($_GET['partial']) && (string) $_GET['partial'] === '1') {
                 plus.addEventListener('click', function (e) {
                     e.preventDefault();
                     e.stopPropagation();
-                    addNodig(card.getAttribute('data-item'), card.getAttribute('data-desc'), card.getAttribute('data-qty'), card.getAttribute('data-hue'));
+                    openQtyPop(card);
                 });
             }
         });

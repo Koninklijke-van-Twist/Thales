@@ -277,7 +277,7 @@ check($s2['status'] === 'partial', 'zonder budget: partial, dag-index blijft sta
 check(is_file($GLOBALS['THALES_DATA_DIR'] . '/.htaccess'), 'data/.htaccess aangemaakt');
 
 
-// ---------- taakcode: opslag, labels, kans + fallback
+// ---------- taakcode: opslag, labels, kans (alleen motortype)
 $wo99 = thales_workorder_components('WO2600099');
 check(($wo99[0]['task_code'] ?? '') === 'CO' && ($wo99[1]['task_code'] ?? '') === 'CO', 'werkorder bewaart Task_Code');
 check(thales_state('workorders_taskfill_oldest_month|KvT') !== null, 'taskfill: eerste nacht heeft een maand gelezen');
@@ -299,7 +299,8 @@ $db->exec("INSERT INTO task_parts(company, wo_no, task_code, brand_key, type_key
     ('KvT', 'WO260000B', 'CO', 'PERKINS', '4016TAG2A', 'TST-1', 4),
     ('KvT', 'WO260000C', 'CO', 'PERKINS', '4016TAG2A', 'TST-2', 3),
     ('KvT', 'WO260000D', 'GOH', 'PERKINS', '4016TAG2A', 'TST-1', 1),
-    ('KvT', 'WO-THIN-1', 'SA', 'OTHER', 'X', 'TST-3', 1)");
+    ('KvT', 'WO-THIN-1', 'SA', 'PERKINS', '4016TAG2A', 'TST-3', 1),
+    ('KvT', 'WO-THIN-2', 'SA', 'OTHER', 'X', 'TST-3', 1)");
 $db->exec("DELETE FROM task_code_labels");
 $db->exec("INSERT INTO task_code_labels(task_code, description, times) VALUES
     ('CO', 'Correctief onderhoud', 3),
@@ -311,9 +312,13 @@ $byItem = array_column($odds['parts'], null, 'item_no');
 check(isset($byItem['TST-1']) && abs($byItem['TST-1']['odds'] - 0.75) < 0.001 && $byItem['TST-1']['times'] === 3, 'TST-1 in 3/4 = 75%');
 check(isset($byItem['TST-2']) && abs($byItem['TST-2']['odds'] - 0.5) < 0.001, 'TST-2 in 2/4 = 50%');
 check(abs($byItem['TST-1']['qty_median'] - 4.0) < 0.01, 'mediaan qty TST-1 = 4 (2,4,4)');
-// Te weinig data op motor+taak → fallback taakbreed
+// Weinig data op motor+taak → toch kansen, level low (geen terugval naar andere motoren)
 $thin = thales_task_odds('SA', 'PERKINS', '4016TAG2A');
-check($thin['level'] === 'task' && $thin['tasks'] === 1 && ($thin['parts'][0]['item_no'] ?? '') === 'TST-3', 'fallback naar taakcode over alle motoren');
+check($thin['level'] === 'low' && $thin['tasks'] === 1 && ($thin['parts'][0]['item_no'] ?? '') === 'TST-3', 'lage zekerheid: 1 SA-taak op dit motortype');
+$empty = thales_task_odds('SA', 'PERKINS', 'ONBEKEND');
+check($empty['level'] === 'none' && $empty['tasks'] === 0 && $empty['parts'] === [], '0 taken op motortype → geen voorstellen');
+$noMotor = thales_task_odds('CO', '', '');
+check($noMotor['level'] === 'none' && $noMotor['tasks'] === 0, 'zonder motor geen kansberekening');
 check(thales_median([1, 3, 2]) === 2.0 && thales_median([1, 2, 3, 4]) === 2.5 && thales_median([]) === 0.0, 'mediaan helper');
 $sug = thales_suggest_tasks('correctief');
 check(($sug[0]['value'] ?? '') === 'CO', 'suggest_tasks fuzzy op omschrijving → CO');
