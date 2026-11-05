@@ -373,12 +373,14 @@ if (isset($_GET['partial']) && (string) $_GET['partial'] === '1') {
             <button type="submit"><?= h(LOC('test.lookup')) ?></button>
             <?php if ($component !== '' && $lookup === null && $woHits === []): ?><p class="muted"><?= h(LOC('test.unknown')) ?></p><?php endif; ?>
             <?php foreach ($woHits as $hit):
-                $wo = $hit['wo_no'] . (trim((string) ($hit['description'] ?? '')) !== '' ? ' · ' . $hit['description'] : '')
+                $memoPrev = thales_wo_memo_preview((string) ($hit['description'] ?? ''));
+                $woLabel = $hit['wo_no'] . ($memoPrev['short'] !== '' ? ' · ' . $memoPrev['short'] : '')
                     . ($hit['company'] !== '' ? ' (' . $hit['company'] . ')' : '');
+                $woTitle = $memoPrev['full'] !== '' ? $memoPrev['full'] : $woLabel;
             ?>
-                <p><?php if ($hit['component_no'] === ''): ?><?= h(LOC('test.wo_no_component', $wo)) ?>
-                <?php elseif ($hit['lookup'] === null): ?><?= h(LOC('test.wo', $wo, $hit['component_no'])) ?><br><span class="muted"><?= h(LOC('test.unknown')) ?></span>
-                <?php else: $m = $hit['lookup']['motor']; ?><?= h(LOC('test.wo', $wo, $hit['component_no'])) ?>
+                <p<?php if ($memoPrev['full'] !== ''): ?> title="<?= h($woTitle) ?>"<?php endif; ?>><?php if ($hit['component_no'] === ''): ?><?= h(LOC('test.wo_no_component', $woLabel)) ?>
+                <?php elseif ($hit['lookup'] === null): ?><?= h(LOC('test.wo', $woLabel, $hit['component_no'])) ?><br><span class="muted"><?= h(LOC('test.unknown')) ?></span>
+                <?php else: $m = $hit['lookup']['motor']; ?><?= h(LOC('test.wo', $woLabel, $hit['component_no'])) ?>
                     <?php if (trim((string) ($hit['task_code'] ?? '')) !== ''): ?> · <?= h(thales_task_label((string) $hit['task_code'])) ?><?php endif; ?><br>
                     <?= $hit['lookup']['role'] === 'SET' ? h(LOC('test.motor', $m['component_no'])) . '<br>' : '' ?><?= h($motorText($m)) ?>
                     <span class="muted">(<?= h(LOC('lib.source', $m['brand_source'])) ?>)</span><?php endif; ?></p>
@@ -524,6 +526,7 @@ if (isset($_GET['partial']) && (string) $_GET['partial'] === '1') {
                     li.setAttribute('role', 'option');
                     li.setAttribute('aria-selected', i === active ? 'true' : 'false');
                     li.textContent = row.label || row.value;
+                    if (row.title) { li.title = row.title; }
                     if (row.sub) {
                         var sub = document.createElement('span');
                         sub.className = 'ac-sub';
@@ -563,7 +566,7 @@ if (isset($_GET['partial']) && (string) $_GET['partial'] === '1') {
                 }).then(function (rows) {
                     if (input.value.trim() !== q) { return; }
                     items = (rows || []).map(opts.mapRow || function (row) {
-                        return { value: row.value, label: row.label || row.value, sub: row.kind || '' };
+                        return { value: row.value, label: row.label || row.value, sub: row.kind || '', title: row.title || '' };
                     });
                     active = items.length ? 0 : -1;
                     render();
@@ -597,7 +600,7 @@ if (isset($_GET['partial']) && (string) $_GET['partial'] === '1') {
         bindSuggest(document.getElementById('component-input'), document.getElementById('component-ac'), {
             minLen: 2,
             url: function (q) { return '?suggest=' + encodeURIComponent(q); },
-            mapRow: function (row) { return { value: row.value, label: row.label || row.value, sub: row.kind || '' }; }
+            mapRow: function (row) { return { value: row.value, label: row.label || row.value, sub: row.kind || '', title: row.title || '' }; }
         });
         bindSuggest(document.getElementById('task-input'), document.getElementById('task-ac'), {
             minLen: 1,

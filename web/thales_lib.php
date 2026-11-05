@@ -42,7 +42,7 @@ const THALES_BC_WORKORDER_DEFAULT = [
     'component' => 'Component_No', // componentnummer; leeg is normaal (8–25%)
     'task_code' => 'Task_Code',           // vaste lijst (Ariadne 05-11-2026)
     'task_description' => 'Task_Description', // vrije tekst; terugval / labels
-    'description' => 'Description', // WO-kopomschrijving; gericht ophalen (niet in brede delta/backfill)
+    'description' => 'KVT_Memo', // vrije WO-memo; gericht ophalen (niet in brede delta/backfill; niet filterbaar)
     'created' => 'Created_On',     // altijd gevuld: backfill per maand + delta
     'start' => 'Start_Date',       // tweede delta-query (kan 0001-01-01 zijn)
     'min_date' => '2002-01-01',    // ondergrens backfill
@@ -127,7 +127,7 @@ function thales_data_dir(): string
 }
 
 /** Schema-versie: omhoog bij nieuwe migraties; page load slaat DDL over als DB al bij is. */
-define('THALES_SCHEMA_VERSION', '4');
+define('THALES_SCHEMA_VERSION', '5');
 
 function thales_db(): PDO
 {
@@ -235,10 +235,22 @@ function thales_migrate(PDO $pdo): void
             $pdo->prepare('DELETE FROM state WHERE key = ?')->execute(['workorders_taskfill_oldest_month|' . $co]);
         }
     }
-    // WO-kop Description: NULL = nog niet opgezocht; '' = opgezocht zonder tekst. Vóór indexen (zie PR #15).
+    // WO-memo (KVT_Memo): NULL = nog niet opgezocht; '' = opgezocht zonder tekst. Vóór indexen (zie PR #15).
     if (!in_array('description', $woCols, true)) {
         $pdo->exec('ALTER TABLE workorders ADD COLUMN description TEXT');
         $woCols[] = 'description';
+    }
+    // Eenmalig: lege descriptions van de mislukte Description-poging (PR #21) opnieuw ophalen als KVT_Memo.
+    $memoReset = false;
+    try {
+        $memoReset = (string) $pdo->query("SELECT value FROM state WHERE key = 'workorders_memo_reset'")->fetchColumn() === '1';
+    } catch (Throwable $e) {
+        $memoReset = false;
+    }
+    if (!$memoReset && in_array('description', $woCols, true)) {
+        $pdo->exec("UPDATE workorders SET description = NULL WHERE description IS NOT NULL AND TRIM(description) = ''");
+        $pdo->prepare('DELETE FROM state WHERE key = ?')->execute(['workorders_description_field']);
+        $pdo->prepare('INSERT OR REPLACE INTO state(key, value) VALUES(?, ?)')->execute(['workorders_memo_reset', '1']);
     }
     $pdo->exec('CREATE INDEX IF NOT EXISTS wo_task ON workorders(task_code)');
     $pdo->exec("CREATE TABLE IF NOT EXISTS task_parts (
@@ -894,7 +906,7 @@ function thales_bc_workorder_config(): array
 function thales_store_workorders(string $company, string $filter, string $today): int
 {
     $cfg = thales_bc_workorder_config();
-    // Geen Description in $select: die komt gericht via thales_fill_workorder_descriptions.
+    // Geen KVT_Memo in $select: die komt gericht via thales_fill_workorder_descriptions.
     $select = [$cfg['key'], $cfg['component'], $cfg['task_code'], $cfg['task_description'], $cfg['created'], $cfg['start']];
     $ins = thales_db()->prepare('INSERT INTO workorders(company, wo_no, component_no, task_code, task_description, created_on, start_date, synced_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(company, wo_no) DO UPDATE SET
@@ -1019,14 +1031,44 @@ function thales_sync_workorders(): string
 }
 
 /**
- * Of AppWerkorders.Description (of geconfigureerde naam) in Mímir bestaat. State:
- * workorders_description_field = 1|0. Bij 0 elke nacht opnieuw proberen (zodra Ariadne het veld
- * publiceert, vult de gerichte pass vanzelf).
+ * Memo opslaan: trim randen, behoud interne regeleinden. Leeg → ''.
+ */
+function thales_wo_memo_normalize(string $memo): string
+{
+    return trim(str_replace("\0", '', $memo));
+}
+
+/**
+ * UI-weergave van een (mogelijk meerregelige) WO-memo: eerste regel, afgekapt op $max tekens.
+ * @return array{short:string,full:string}
+ */
+function thales_wo_memo_preview(string $memo, int $max = 120): array
+{
+    $full = thales_wo_memo_normalize($memo);
+    if ($full === '') {
+        return ['short' => '', 'full' => ''];
+    }
+    $parts = preg_split('/\r\n|\r|\n/u', $full, 2);
+    $first = trim((string) ($parts[0] ?? ''));
+    if ($first === '') {
+        $first = preg_replace('/\s+/u', ' ', $full) ?? $full;
+    }
+    if (mb_strlen($first) > $max) {
+        $short = mb_substr($first, 0, max(1, $max - 1)) . '…';
+    } else {
+        $short = $first;
+    }
+    return ['short' => $short, 'full' => $full];
+}
+
+/**
+ * Of AppWerkorders.KVT_Memo (of geconfigureerde naam) in Mímir bestaat. State:
+ * workorders_description_field = 1|0. Bij 0 elke nacht opnieuw proberen.
  */
 function thales_workorder_description_field_available(): bool
 {
     $cfg = thales_bc_workorder_config();
-    $field = (string) ($cfg['description'] ?? 'Description');
+    $field = (string) ($cfg['description'] ?? 'KVT_Memo');
     $cached = thales_state('workorders_description_field');
     if ($cached === '1') {
         return true;
@@ -1048,19 +1090,19 @@ function thales_workorder_description_field_available(): bool
 }
 
 /**
- * Description gericht ophalen: (a) WOs op rapporten van deze run, (b) cache-rijen met description IS NULL.
- * Batches per bedrijf op No; binnen budget. Lege/missende treffers → description '' (niet opnieuw).
- * Description zit níet in de brede delta/backfill-$select.
+ * KVT_Memo gericht ophalen: (a) WOs op rapporten van deze run, (b) cache-rijen met description IS NULL.
+ * Batches per bedrijf op No ($select=No,KVT_Memo); niet filteren op memo. Lege/missende → description ''.
+ * KVT_Memo zit níet in de brede delta/backfill-$select.
  */
 function thales_fill_workorder_descriptions(float $deadline, ?string $runSinceIso = null): string
 {
     $cfg = thales_bc_workorder_config();
-    $field = (string) ($cfg['description'] ?? 'Description');
+    $field = (string) ($cfg['description'] ?? 'KVT_Memo');
     try {
         if (!thales_workorder_description_field_available()) {
-            $msg = 'AppWerkorders heeft geen veld ' . $field . ' in Mímir (KvT/HvT). Ariadne moet Description aan de webservice toevoegen; daarna vult Thales vanzelf.';
+            $msg = 'AppWerkorders heeft geen veld ' . $field . ' in Mímir. Zonder memo geen WO-omschrijving.';
             thales_log($msg);
-            return 'veld ' . $field . ' ontbreekt (Ariadne)';
+            return 'veld ' . $field . ' ontbreekt';
         }
     } catch (Throwable $e) {
         thales_log('WO-description probe: ' . $e->getMessage());
@@ -1116,11 +1158,11 @@ function thales_fill_workorder_descriptions(float $deadline, ?string $runSinceIs
             foreach ($rows as $row) {
                 $no = strtoupper(trim((string) ($row[$cfg['key']] ?? '')));
                 if ($no !== '') {
-                    $byNo[$no] = trim((string) ($row[$field] ?? ''));
+                    $byNo[$no] = (string) ($row[$field] ?? '');
                 }
             }
             foreach ($batch as $no) {
-                $desc = $byNo[$no] ?? '';
+                $desc = thales_wo_memo_normalize($byNo[$no] ?? '');
                 $upd->execute([$desc, $company, $no]);
                 $coChecked++;
                 $checked++;
@@ -1189,15 +1231,18 @@ function thales_suggest(string $prefix, int $limit = 20): array
     $stmt->execute([':p' => $like]);
     $byValue = [];
     foreach ($stmt->fetchAll() as $row) {
-        $byValue[(string) $row['value']] = ['value' => (string) $row['value'], 'kind' => (string) $row['kind'], 'label' => (string) $row['value'], 'score' => 1.0];
+        $byValue[(string) $row['value']] = ['value' => (string) $row['value'], 'kind' => (string) $row['kind'], 'label' => (string) $row['value'], 'title' => (string) $row['value'], 'score' => 1.0];
     }
-    // Fuzzy / substring op WO-description (en label = No · Description).
+    // Fuzzy / substring op volledige WO-memo; label = No · eerste regel (afgekapt).
     $descRows = thales_db()->query("SELECT wo_no, company, description FROM workorders WHERE description IS NOT NULL AND TRIM(description) != ''")->fetchAll();
     $q = trim($prefix);
     foreach ($descRows as $row) {
         $no = (string) $row['wo_no'];
-        $desc = trim((string) $row['description']);
-        $hay = strtoupper($no . ' ' . $desc);
+        $desc = thales_wo_memo_normalize((string) $row['description']);
+        if ($desc === '') {
+            continue;
+        }
+        $hay = strtoupper($no . ' ' . preg_replace('/\s+/u', ' ', $desc));
         $score = 0.0;
         if (str_starts_with(strtoupper($no), $p)) {
             $score = 1.0;
@@ -1211,13 +1256,15 @@ function thales_suggest(string $prefix, int $limit = 20): array
             continue;
         }
         $kind = 'werkorder ' . (string) $row['company'];
-        $label = $no . ' · ' . $desc;
+        $prev = thales_wo_memo_preview($desc);
+        $label = $no . ' · ' . $prev['short'];
         if (!isset($byValue[$no]) || $score > (float) $byValue[$no]['score']) {
-            $byValue[$no] = ['value' => $no, 'kind' => $kind, 'label' => $label, 'score' => $score];
+            $byValue[$no] = ['value' => $no, 'kind' => $kind, 'label' => $label, 'title' => $prev['full'], 'score' => $score];
         } else {
-            // Prefix-treffer: verrijk label met description.
+            // Prefix-treffer: verrijk label met memo-preview.
             if ($desc !== '' && !str_contains((string) $byValue[$no]['label'], ' · ')) {
                 $byValue[$no]['label'] = $label;
+                $byValue[$no]['title'] = $prev['full'];
             }
             if (!str_contains((string) $byValue[$no]['kind'], $kind)) {
                 $byValue[$no]['kind'] = trim((string) $byValue[$no]['kind'] . ',' . $kind, ',');
@@ -1226,7 +1273,12 @@ function thales_suggest(string $prefix, int $limit = 20): array
     }
     $out = array_values($byValue);
     usort($out, static fn($a, $b): int => [$b['score'], $a['value']] <=> [$a['score'], $b['value']]);
-    return array_map(static fn($r) => ['value' => $r['value'], 'kind' => $r['kind'], 'label' => $r['label']], array_slice($out, 0, max(1, $limit)));
+    return array_map(static fn($r) => [
+        'value' => $r['value'],
+        'kind' => $r['kind'],
+        'label' => $r['label'],
+        'title' => (string) ($r['title'] ?? $r['label']),
+    ], array_slice($out, 0, max(1, $limit)));
 }
 
 /* ---------------------------------------------------------------- aggregaten */
@@ -1579,7 +1631,7 @@ function thales_nightly(?int $budgetSeconds = null): array
         $deltaDone = thales_sync_delta($deadline);
         thales_progress('SharePoint-delta ' . ($deltaDone ? 'compleet' : 'nog niet compleet (gaat volgende run verder)'));
         $pendingDone = thales_process_pending($deadline, $summary);
-        // WO-Description gericht (rapporten deze run + cache zonder description); niet in brede $select.
+        // WO-memo (KVT_Memo) gericht (rapporten deze run + cache zonder description); niet in brede $select.
         try {
             $runSince = gmdate('c', (int) $start);
             thales_progress('WO-descriptions bijwerken');
