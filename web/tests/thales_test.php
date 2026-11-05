@@ -316,4 +316,83 @@ $sug2 = thales_suggest_tasks('goh');
 check(($sug2[0]['value'] ?? '') === 'GOH', 'suggest_tasks prefix op code');
 check(str_contains(thales_task_label('CO'), 'Correctief'), 'task_label toont omschrijving');
 
+
+// ---------- schema-upgrade vanaf pre-#15 DB (subprocess: verse static PDO)
+$upgradeDir = sys_get_temp_dir() . '/thales-upgrade-' . getmypid();
+@mkdir($upgradeDir);
+$upgradeDb = $upgradeDir . '/thales.sqlite';
+@unlink($upgradeDb);
+$old = new PDO('sqlite:' . $upgradeDb);
+$old->exec("CREATE TABLE state (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE workorders (company TEXT NOT NULL, wo_no TEXT NOT NULL, component_no TEXT, created_on TEXT, start_date TEXT, synced_at TEXT, PRIMARY KEY (company, wo_no));
+CREATE TABLE reports (item_id TEXT PRIMARY KEY, name TEXT, web_url TEXT, folder_name TEXT, equipment_no TEXT, report_date TEXT, wo TEXT, task_codes TEXT, size INTEGER, created TEXT, modified TEXT, parse_status TEXT NOT NULL DEFAULT 'pending', parse_note TEXT, sheet TEXT, processed_at TEXT);
+CREATE TABLE report_components (item_id TEXT NOT NULL, role TEXT, component_no TEXT, brand_raw TEXT, brand TEXT, type TEXT, serial TEXT, is_motor INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE report_parts (item_id TEXT NOT NULL, line INTEGER, item_no TEXT, description_raw TEXT, qty REAL, unit TEXT);
+CREATE TABLE components (component_no TEXT PRIMARY KEY, parent_no TEXT, sub_entity TEXT, manufacturer_code TEXT, manufacturer_name TEXT, model TEXT, synced_at TEXT);
+CREATE TABLE report_motor (item_id TEXT PRIMARY KEY, component_no TEXT, brand_key TEXT, brand TEXT, type_key TEXT, type TEXT, brand_source TEXT);
+CREATE TABLE items (item_no TEXT PRIMARY KEY, description TEXT, excel_name TEXT NOT NULL DEFAULT '', bc_type TEXT NOT NULL DEFAULT '', is_task INTEGER NOT NULL DEFAULT 0, search TEXT, synced_at TEXT);
+CREATE TABLE usage (brand_key TEXT, brand TEXT, type_key TEXT, type TEXT, brand_source TEXT, item_no TEXT, times_used INTEGER, qty_total REAL, PRIMARY KEY (brand_key, type_key, item_no));
+CREATE TABLE resources (resource_no TEXT PRIMARY KEY, name TEXT, synced_at TEXT);
+CREATE TABLE folders (id TEXT PRIMARY KEY, name TEXT, parent_id TEXT);
+INSERT INTO workorders(company, wo_no, component_no) VALUES ('KVT','WO-OLD','C1');");
+$old = null;
+$cmd = escapeshellarg(PHP_BINARY) . ' -r ' . escapeshellarg(
+    '$GLOBALS["THALES_DATA_DIR"]=' . var_export($upgradeDir, true) . ';'
+    . 'require ' . var_export(dirname(__DIR__) . '/thales_lib.php', true) . ';'
+    . '$db=thales_db();'
+    . '$cols=array_column($db->query("PRAGMA table_info(workorders)")->fetchAll(),"name");'
+    . 'if (!in_array("task_code",$cols,true)||!in_array("task_description",$cols,true)) {fwrite(STDERR,"missing cols\n"); exit(1);}'
+    . 'if (!$db->query("SELECT 1 FROM sqlite_master WHERE name=\"task_parts\"")->fetchColumn()) {fwrite(STDERR,"no task_parts\n"); exit(1);}'
+    . 'if ((string)$db->query("SELECT value FROM state WHERE key=\"schema_version\"")->fetchColumn() !== (string)THALES_SCHEMA_VERSION) {fwrite(STDERR,"bad version\n"); exit(1);}'
+    . '$h=thales_workorder_components("WO-OLD");'
+    . 'if (($h[0]["component_no"]??"")!=="C1") {fwrite(STDERR,"wo fail\n"); exit(1);}'
+    . 'echo "upgrade-ok\n";'
+);
+exec($cmd, $out, $code);
+check($code === 0 && ($out[0] ?? '') === 'upgrade-ok', 'schema-upgrade vanaf pre-#15 DB (task_code + task_parts)');
+
+// ---------- page-read tijdens write-lock (WAL + busy_timeout): korte exclusive lock, read moet wachten en slagen
+$lockDir = sys_get_temp_dir() . '/thales-lock-' . getmypid();
+@mkdir($lockDir);
+$GLOBALS['THALES_DATA_DIR'] = $lockDir;
+// forceer verse connectie: static PDO wijst nog naar vorige testdir — open via subprocess
+$lockDb = $lockDir . '/thales.sqlite';
+@unlink($lockDb);
+$boot = escapeshellarg(PHP_BINARY) . ' -r ' . escapeshellarg(
+    '$GLOBALS["THALES_DATA_DIR"]=' . var_export($lockDir, true) . ';'
+    . 'require ' . var_export(dirname(__DIR__) . '/thales_lib.php', true) . ';'
+    . 'thales_db(); echo "boot\n";'
+);
+exec($boot, $bout, $bcode);
+check($bcode === 0, 'lock-test: schema gebootstrapt');
+$reader = escapeshellarg(PHP_BINARY) . ' -r ' . escapeshellarg(
+    '$GLOBALS["THALES_DATA_DIR"]=' . var_export($lockDir, true) . ';'
+    . 'require ' . var_export(dirname(__DIR__) . '/thales_lib.php', true) . ';'
+    . 'usleep(200000);' // 200ms: writer houdt lock vast
+    . '$t=microtime(true); $n=(int)thales_db()->query("SELECT COUNT(*) FROM workorders")->fetchColumn();'
+    . 'echo "read-ok $n " . round((microtime(true)-$t)*1000) . "\n";'
+);
+$writer = escapeshellarg(PHP_BINARY) . ' -r ' . escapeshellarg(
+    '$db=new PDO("sqlite:" . ' . var_export($lockDb, true) . ');'
+    . '$db->exec("PRAGMA busy_timeout=60000");'
+    . '$db->exec("BEGIN IMMEDIATE");'
+    . '$db->exec("CREATE TABLE IF NOT EXISTS _lock_probe(x INTEGER)");'
+    . 'usleep(500000);' // 500ms write-lock
+    . '$db->exec("COMMIT");'
+    . 'echo "write-ok\n";'
+);
+$descriptors = [1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
+$pw = proc_open($writer, $descriptors, $pipesW);
+usleep(50000); // writer start eerst
+$pr = proc_open($reader, $descriptors, $pipesR);
+$outW = stream_get_contents($pipesW[1]);
+$outR = stream_get_contents($pipesR[1]);
+fclose($pipesW[1]); fclose($pipesW[2]);
+fclose($pipesR[1]); fclose($pipesR[2]);
+$cw = proc_close($pw);
+$cr = proc_close($pr);
+check($cw === 0 && str_contains($outW, 'write-ok'), 'lock-test: writer klaar');
+check($cr === 0 && str_contains($outR, 'read-ok'), 'lock-test: page-read wacht op lock en slaagt (WAL/busy_timeout)');
+
 echo "Alle tests geslaagd\n";
+

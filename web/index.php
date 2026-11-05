@@ -83,9 +83,15 @@ if (isset($_GET['suggest_tasks'])) {
  * Page load (alleen eigen cache, nooit live BC/SharePoint)
  */
 $tab = ($_GET['tab'] ?? 'library') === 'test' ? 'test' : 'library';
-$status = thales_status();
+try {
+    $status = thales_status();
+} catch (Throwable $e) {
+    // SQLite-lock of migratie-race tijdens nightly: geen harde 500.
+    $status = ['last_run' => null, 'day_index' => '–', 'counts' => [], 'items_count' => 0, 'items_synced_on' => null];
+    error_log('Thales page status: ' . $e->getMessage());
+}
 $run = $status['last_run'] ?? null;
-$c = $status['counts'];
+$c = $status['counts'] ?? [];
 $statusLine = LOC('status.line',
     $run ? (new DateTimeImmutable((string) $run['at']))->setTimezone(new DateTimeZone('Europe/Amsterdam'))->format('d-m-Y H:i') : LOC('status.never'),
     (string) ($run['status'] ?? '–'), $status['day_index'] ?? '–',
@@ -211,7 +217,14 @@ if (isset($_GET['partial']) && (string) $_GET['partial'] === '1') {
         </nav>
     </header>
 
-<?php if ($tab === 'library'): $brands = thales_brands(); ?>
+<?php if ($tab === 'library'):
+    try {
+        $brands = thales_brands();
+    } catch (Throwable $e) {
+        $brands = [];
+        error_log('Thales brands: ' . $e->getMessage());
+    }
+?>
     <section>
         <?php if ($brands === []): ?><p class="muted"><?= h(LOC('lib.empty')) ?></p><?php endif; ?>
         <?php foreach ($brands as $b): ?>
