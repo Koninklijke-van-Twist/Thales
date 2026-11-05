@@ -22,8 +22,42 @@ function thales_fmt_qty(mixed $value): string
     return rtrim(rtrim(number_format((float) $value, 2, ',', '.'), '0'), ',');
 }
 
+
+/** Alleen modal-HTML (overlay + inhoud) voor full page én ?partial=1. */
+function thales_render_parts_modal(string $brandKey, string $typeKey, string $itemNo): void
+{
+    $parts = thales_parts($brandKey, $typeKey);
+    ?>
+    <div class="modal-overlay" id="parts-modal">
+    <section id="parts" class="modal" role="dialog" aria-modal="true" aria-labelledby="parts-title">
+        <a class="modal-close" href="?tab=library" aria-label="<?= h(LOC('lib.close')) ?>" title="<?= h(LOC('lib.close')) ?>">&times;</a>
+        <h2 id="parts-title"><?= h($brandKey) ?> · <?= h($typeKey !== '' ? $typeKey : LOC('lib.type_unknown')) ?></h2>
+        <p class="muted"><?= h(LOC('lib.source', (string) ($parts[0]['brand_source'] ?? '–'))) ?> · <?= h(LOC('lib.pick')) ?></p>
+        <div class="part-grid">
+            <?php foreach ($parts as $p): $isActive = $p['item_no'] === $itemNo; $hue = thales_part_hue((string) $p['description'], (string) $p['item_no']); ?>
+                <a class="part-card<?= $isActive ? ' active' : '' ?>" href="?<?= h(http_build_query(['tab' => 'library', 'brand' => $brandKey, 'type' => $typeKey, 'item' => $p['item_no']])) ?>">
+                    <span class="part-bar" style="background: hsl(<?= (int) $hue ?>, 55%, 45%);"></span>
+                    <strong class="part-name<?= $p['description'] === '' ? ' muted' : '' ?>"><?= h($p['description'] !== '' ? $p['description'] : LOC('lib.no_description')) ?></strong>
+                    <span class="part-no"><?= h($p['item_no']) ?></span>
+                    <span class="muted part-stats"><?= h(LOC('col.times')) ?>: <?= (int) $p['times_used'] ?> · <?= h(LOC('col.qty')) ?>: <?= h(thales_fmt_qty($p['qty_total'])) ?></span>
+                </a>
+                <?php if ($isActive): ?>
+                <div class="part-sources"><strong><?= h(LOC('lib.sources')) ?> · <?= h($p['item_no']) ?>:</strong>
+                    <ul><?php foreach (thales_part_sources($brandKey, $typeKey, $itemNo) as $src): ?>
+                        <li><a href="<?= h($src['web_url']) ?>" target="_blank" rel="noopener"><?= h($src['wo']) ?> · <?= h($src['report_date']) ?></a> <span class="muted"><?= h($src['name']) ?></span></li>
+                    <?php endforeach; ?></ul></div>
+                <?php endif; ?>
+            <?php endforeach; ?>
+        </div>
+    </section>
+    </div>
+    <?php
+}
+
+
 /**
  * Autocomplete (JSON, zelfde auth): ?suggest=<prefix> | ?suggest_parts=<prefix>&brand=&type=
+ * Modal-fragment (HTML, zelfde auth): ?tab=library&brand=&type=&item=&partial=1
  */
 if (isset($_GET['suggest'])) {
     header('Content-Type: application/json; charset=utf-8');
@@ -69,6 +103,18 @@ $unknown = LOC('test.unknown_value');
 $motorText = static fn(array $m): string => LOC('test.brand') . ': ' . (trim((string) $m['brand']) !== '' && $m['brand_key'] !== '?' ? $m['brand'] : $unknown)
     . ' · ' . LOC('test.type') . ': ' . (trim((string) $m['type']) !== '' ? $m['type'] : $unknown);
 $results = $tab === 'test' && ($query !== '' || $lookup) ? thales_search($query, (string) ($lookup['motor']['brand_key'] ?? ''), (string) ($lookup['motor']['type_key'] ?? '')) : null;
+
+/** Fragment: alleen de parts-modal (zelfde auth), voor openen zonder herladen. */
+if (isset($_GET['partial']) && (string) $_GET['partial'] === '1') {
+    header('Content-Type: text/html; charset=utf-8');
+    if ($brandKey === '') {
+        http_response_code(400);
+        echo '';
+        exit;
+    }
+    thales_render_parts_modal($brandKey, $typeKey, $itemNo);
+    exit;
+}
 ?><!DOCTYPE html>
 <html lang="<?= h(getHtmlLang()) ?>">
 <head>
@@ -152,49 +198,101 @@ $results = $tab === 'test' && ($query !== '' || $lookup) ? thales_search($query,
             </div>
         <?php endforeach; ?>
     </section>
-    <?php if ($brandKey !== ''): $parts = thales_parts($brandKey, $typeKey); ?>
-    <div class="modal-overlay" id="parts-modal">
-    <section id="parts" class="modal" role="dialog" aria-modal="true" aria-labelledby="parts-title">
-        <a class="modal-close" href="?tab=library" aria-label="<?= h(LOC('lib.close')) ?>" title="<?= h(LOC('lib.close')) ?>">&times;</a>
-        <h2 id="parts-title"><?= h($brandKey) ?> · <?= h($typeKey !== '' ? $typeKey : LOC('lib.type_unknown')) ?></h2>
-        <p class="muted"><?= h(LOC('lib.source', (string) ($parts[0]['brand_source'] ?? '–'))) ?> · <?= h(LOC('lib.pick')) ?></p>
-        <div class="part-grid">
-            <?php foreach ($parts as $p): $isActive = $p['item_no'] === $itemNo; $hue = thales_part_hue((string) $p['description'], (string) $p['item_no']); ?>
-                <a class="part-card<?= $isActive ? ' active' : '' ?>" href="?<?= h(http_build_query(['tab' => 'library', 'brand' => $brandKey, 'type' => $typeKey, 'item' => $p['item_no']])) ?>">
-                    <span class="part-bar" style="background: hsl(<?= (int) $hue ?>, 55%, 45%);"></span>
-                    <strong class="part-name<?= $p['description'] === '' ? ' muted' : '' ?>"><?= h($p['description'] !== '' ? $p['description'] : LOC('lib.no_description')) ?></strong>
-                    <span class="part-no"><?= h($p['item_no']) ?></span>
-                    <span class="muted part-stats"><?= h(LOC('col.times')) ?>: <?= (int) $p['times_used'] ?> · <?= h(LOC('col.qty')) ?>: <?= h(thales_fmt_qty($p['qty_total'])) ?></span>
-                </a>
-                <?php if ($isActive): ?>
-                <div class="part-sources"><strong><?= h(LOC('lib.sources')) ?> · <?= h($p['item_no']) ?>:</strong>
-                    <ul><?php foreach (thales_part_sources($brandKey, $typeKey, $itemNo) as $src): ?>
-                        <li><a href="<?= h($src['web_url']) ?>" target="_blank" rel="noopener"><?= h($src['wo']) ?> · <?= h($src['report_date']) ?></a> <span class="muted"><?= h($src['name']) ?></span></li>
-                    <?php endforeach; ?></ul></div>
-                <?php endif; ?>
-            <?php endforeach; ?>
-        </div>
-    </section>
-    </div>
+    <?php if ($brandKey !== ''): thales_render_parts_modal($brandKey, $typeKey, $itemNo); endif; ?>
     <script>
     (function () {
-        var overlay = document.getElementById('parts-modal');
-        if (!overlay) { return; }
         var closeUrl = '?tab=library';
-        document.body.style.overflow = 'hidden';
+        var mount = document.querySelector('main');
+        if (!mount || !window.fetch) { return; }
+
+        function overlay() { return document.getElementById('parts-modal'); }
+
+        function bindOverlay(el) {
+            if (!el || el.dataset.bound === '1') { return; }
+            el.dataset.bound = '1';
+            document.body.style.overflow = 'hidden';
+            var closer = el.querySelector('.modal-close');
+            if (closer) {
+                closer.addEventListener('click', function (e) { e.preventDefault(); closeModal(); });
+            }
+            el.addEventListener('click', function (e) { if (e.target === el) { closeModal(); } });
+            var active = el.querySelector('.part-sources');
+            if (active) { active.scrollIntoView({ block: 'nearest' }); }
+        }
+
         function closeModal() {
-            overlay.hidden = true;
+            var el = overlay();
+            if (!el) { return; }
+            el.hidden = true;
             document.body.style.overflow = '';
             if (window.history && history.replaceState) { history.replaceState(null, '', closeUrl); }
         }
-        overlay.querySelector('.modal-close').addEventListener('click', function (e) { e.preventDefault(); closeModal(); });
-        overlay.addEventListener('click', function (e) { if (e.target === overlay) { closeModal(); } });
-        document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && !overlay.hidden) { closeModal(); } });
-        var active = overlay.querySelector('.part-sources');
-        if (active) { active.scrollIntoView({ block: 'nearest' }); }
+
+        function openHtml(html, url, push) {
+            var wrap = document.createElement('div');
+            wrap.innerHTML = String(html).trim();
+            var next = wrap.firstElementChild;
+            if (!next) { return; }
+            var cur = overlay();
+            if (cur) { cur.replaceWith(next); } else { mount.appendChild(next); }
+            next.hidden = false;
+            bindOverlay(next);
+            if (push && window.history && history.pushState) { history.pushState({ thalesModal: 1 }, '', url); }
+        }
+
+        function loadModal(url, push) {
+            var u = url;
+            if (u.indexOf('partial=') === -1) {
+                u += (u.indexOf('?') >= 0 ? '&' : '?') + 'partial=1';
+            }
+            return fetch(u, { credentials: 'same-origin', headers: { 'Accept': 'text/html' } })
+                .then(function (r) { if (!r.ok) { throw new Error('modal'); } return r.text(); })
+                .then(function (html) { openHtml(html, url, push); });
+        }
+
+        function isModifiedClick(e) {
+            return e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey;
+        }
+
+        document.addEventListener('click', function (e) {
+            if (isModifiedClick(e)) { return; }
+            var typeA = e.target.closest && e.target.closest('a.type-card');
+            if (typeA && mount.contains(typeA)) {
+                e.preventDefault();
+                loadModal(typeA.getAttribute('href'), true).catch(function () { location.href = typeA.href; });
+                return;
+            }
+            var partA = e.target.closest && e.target.closest('#parts-modal a.part-card');
+            if (partA) {
+                e.preventDefault();
+                loadModal(partA.getAttribute('href'), true).catch(function () { location.href = partA.href; });
+            }
+        });
+
+        document.addEventListener('keydown', function (e) {
+            if (e.key === 'Escape') {
+                var el = overlay();
+                if (el && !el.hidden) { closeModal(); }
+            }
+        });
+
+        window.addEventListener('popstate', function () {
+            var params = new URLSearchParams(location.search);
+            if (params.get('brand')) {
+                loadModal(location.pathname + location.search, false).catch(function () { location.reload(); });
+            } else {
+                var el = overlay();
+                if (el) {
+                    el.hidden = true;
+                    document.body.style.overflow = '';
+                }
+            }
+        });
+
+        var existing = overlay();
+        if (existing) { bindOverlay(existing); }
     })();
     </script>
-    <?php endif; ?>
 
 <?php else: ?>
     <section>
