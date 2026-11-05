@@ -120,6 +120,13 @@ $GLOBALS['THALES_MIMIR'] = function (string $table, array $select, string $filte
     if ($table === 'AppItems' && str_contains($filter, "'T'")) {
         return [['No' => 'TST-1', 'Description' => 'STARTACCU 24V'], ['No' => 'TST-2', 'Description' => 'OLIEFILTER'], ['No' => 'TST-3', 'Description' => 'STARTACCU 12V']];
     }
+    if ($table === 'AppWerkorders') {
+        $prev = (new DateTimeImmutable('first day of last month'))->format('Y-m-d');
+        if (str_contains($filter, ' lt ')) { // backfill: één maand
+            return str_contains($filter, 'ge ' . $prev) ? [['No' => 'WO2500001', 'Component_No' => '90000001', 'Start_Date' => $prev]] : [];
+        }
+        return [['No' => 'WO2600099', 'Component_No' => '90000002', 'Start_Date' => date('Y-m-d')], ['No' => 'WO2600098', 'Component_No' => '', 'Start_Date' => date('Y-m-d')]];
+    }
     return [];
 };
 $file = fn(string $id, string $name, string $parent, string $mod) => ['id' => $id, 'name' => $name, 'file' => [], 'size' => 10, 'parentReference' => ['id' => $parent],
@@ -144,6 +151,14 @@ check($lookup['role'] === 'SET' && $lookup['motor']['component_no'] === '9000000
 $search = thales_search('startacu', 'PERKINS', '4016TAG2A');
 check(($search['used'][0]['item_no'] ?? '') === 'TST-1' && ($search['other'][0]['item_no'] ?? '') === 'TST-3', 'fuzzy: gebruikt eerst, dan overige (typefout startacu)');
 
+// Werkorders: delta + één maand backfill per nacht
+check(thales_state('workorders_backfill_oldest_month') === (new DateTimeImmutable('first day of last month'))->format('Y-m') && thales_state('workorders_backfill_done') === null, 'backfill: één maand terug, nog niet klaar');
+check(thales_workorder_component('wo2600099') === '90000002' && thales_workorder_component('WO2500001') === '90000001', 'werkorder => component (delta en backfill)');
+check(thales_workorder_component('WO2600001') === '90000001' && thales_workorder_component('WO2600098') === null, 'werkorder uit rapport; leeg component => null');
+$sugg = array_column(thales_suggest('wo26'), 'value');
+check(in_array('WO2600099', $sugg, true) && in_array('WO2600001', $sugg, true) && array_column(thales_suggest('9000'), 'value') === ['90000001', '90000002', '90000003'], 'autocomplete prefix op werkorders en componenten');
+check(thales_suggest('%') === [] && count(thales_suggest('9', 1)) === 1, 'autocomplete: % letterlijk, limiet');
+
 // Correctie: zelfde item opnieuw gewijzigd => vervangt, geen dubbeltelling
 $deltaPages = [['value' => [$file('A', '90000001_20260101_WO2600001_10H_CO_1.xlsx', 'F2', gmdate('Y-m-d\TH:i:s\Z'))], '@odata.deltaLink' => 'https://g/delta?token=2']];
 thales_nightly(60);
@@ -155,6 +170,7 @@ $db->exec("UPDATE reports SET parse_status = 'processing' WHERE item_id = 'A'");
 $deltaPages = [['value' => [], '@odata.deltaLink' => 'https://g/delta?token=3']];
 thales_nightly(60);
 $a = $db->query("SELECT parse_status, retry_count, first_failed_at FROM reports WHERE item_id = 'A'")->fetch();
+check(thales_state('workorders_backfill_done') === '1', 'backfill klaar na een lege maand');
 check($a['parse_status'] === 'ok' && (int) $a['retry_count'] === 0 && $a['first_failed_at'] === null, 'gecrasht rapport via retry-lijst opnieuw verwerkt');
 check(str_contains((string) file_get_contents($GLOBALS['THALES_DATA_DIR'] . '/nightly.log'), 'Rapport: 90000001_20260101_WO2600001_10H_CO_1.xlsx (10 bytes)'), 'naam en grootte gelogd voor download');
 // Een week lang mislukt => given_up, ook een nieuwe wijzigingsdatum zet hem niet terug
