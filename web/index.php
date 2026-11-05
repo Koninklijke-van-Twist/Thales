@@ -73,6 +73,11 @@ if (isset($_GET['suggest_parts'])) {
     ));
     exit;
 }
+if (isset($_GET['suggest_tasks'])) {
+    header('Content-Type: application/json; charset=utf-8');
+    echo json_encode(thales_suggest_tasks((string) $_GET['suggest_tasks']));
+    exit;
+}
 
 /**
  * Page load (alleen eigen cache, nooit live BC/SharePoint)
@@ -93,16 +98,27 @@ $typeKey = (string) ($_GET['type'] ?? '');
 $itemNo = (string) ($_GET['item'] ?? '');
 $component = trim((string) ($_GET['component'] ?? ''));
 $query = trim((string) ($_GET['q'] ?? ''));
+$taskCode = strtoupper(trim((string) ($_GET['task'] ?? '')));
 $lookup = $tab === 'test' && $component !== '' ? thales_component_lookup($component) : null;
 $woHits = $tab === 'test' && $component !== '' && $lookup === null ? thales_workorder_components($component) : [];
 foreach ($woHits as $i => $hit) { // werkorder ingevuld: component(en) erbij opzoeken, alle bedrijven
     $woHits[$i]['lookup'] = $hit['component_no'] !== '' ? thales_component_lookup($hit['component_no']) : null;
     $lookup ??= $woHits[$i]['lookup']; // onderdelen van de eerste gevonden
+    if ($taskCode === '' && trim((string) ($hit['task_code'] ?? '')) !== '') {
+        $taskCode = strtoupper(trim((string) $hit['task_code']));
+    }
 }
 $unknown = LOC('test.unknown_value');
 $motorText = static fn(array $m): string => LOC('test.brand') . ': ' . (trim((string) $m['brand']) !== '' && $m['brand_key'] !== '?' ? $m['brand'] : $unknown)
     . ' · ' . LOC('test.type') . ': ' . (trim((string) $m['type']) !== '' ? $m['type'] : $unknown);
-$results = $tab === 'test' && ($query !== '' || $lookup) ? thales_search($query, (string) ($lookup['motor']['brand_key'] ?? ''), (string) ($lookup['motor']['type_key'] ?? '')) : null;
+$motorBrand = (string) ($lookup['motor']['brand_key'] ?? '');
+$motorType = (string) ($lookup['motor']['type_key'] ?? '');
+$taskOdds = $tab === 'test' && $taskCode !== '' ? thales_task_odds($taskCode, $motorBrand, $motorType) : null;
+$results = $tab === 'test' && ($query !== '' || ($lookup && $taskCode === '')) ? thales_search($query, $motorBrand, $motorType) : null;
+// Met taakcode: zoekbalk blijft beschikbaar naast de kanskaarten (zonder taak ≈ oude gedrag).
+if ($tab === 'test' && $taskCode !== '' && $query !== '') {
+    $results = thales_search($query, $motorBrand, $motorType);
+}
 
 /** Fragment: alleen de parts-modal (zelfde auth), voor openen zonder herladen. */
 if (isset($_GET['partial']) && (string) $_GET['partial'] === '1') {
@@ -166,6 +182,19 @@ if (isset($_GET['partial']) && (string) $_GET['partial'] === '1') {
         .modal h2 { padding-right: 40px; }
         .modal-close { background: var(--kvt-main-blue); color: #fff; border-radius: 6px; text-decoration: none; position: absolute; top: 10px; right: 10px; padding: 4px 11px; font-size: 1.2rem; line-height: 1; }
         @media (max-width: 600px) { .modal-overlay { padding: 0; } .modal { max-height: 100vh; height: 100%; border-radius: 0; padding: 12px; } th, td { padding: 5px 6px; } }
+
+        .test-layout { display: grid; grid-template-columns: 1fr minmax(220px, 280px); gap: 16px; align-items: start; }
+        @media (max-width: 800px) { .test-layout { grid-template-columns: 1fr; } }
+        .nodig-panel { position: sticky; top: 12px; min-height: 180px; }
+        .nodig-panel.drag-over { outline: 2px dashed var(--kvt-main-blue); background: var(--kvt-row-ok); }
+        .nodig-list { list-style: none; margin: 8px 0 0; padding: 0; }
+        .nodig-list li { display: flex; gap: 8px; align-items: flex-start; padding: 8px; border: 1px solid var(--kvt-line); border-radius: 6px; margin-bottom: 6px; background: #fff; }
+        .nodig-list .nodig-meta { flex: 1; min-width: 0; }
+        .nodig-list button { background: transparent; color: var(--kvt-danger); padding: 2px 8px; }
+        .odds-card { cursor: grab; position: relative; }
+        .odds-card .odds-add { position: absolute; top: 10px; right: 8px; background: var(--kvt-main-blue); color: #fff; border: 0; border-radius: 50%; width: 28px; height: 28px; line-height: 28px; padding: 0; font-size: 1.1rem; }
+        .odds-pct { font-size: 1.25rem; font-weight: 700; color: var(--kvt-perkins-blue); }
+        form.test-form label { display: inline-block; margin-right: 12px; margin-bottom: 8px; vertical-align: top; }
     </style>
 </head>
 <body>
@@ -295,17 +324,22 @@ if (isset($_GET['partial']) && (string) $_GET['partial'] === '1') {
     </script>
 
 <?php else: ?>
+    <div class="test-layout">
+    <div class="test-main">
     <section>
-        <form method="get">
+        <form method="get" class="test-form">
             <input type="hidden" name="tab" value="test">
             <label><?= h(LOC('test.component')) ?><br><input type="text" name="component" value="<?= h($component) ?>" list="component-suggest" autocomplete="off"></label>
             <datalist id="component-suggest"></datalist>
+            <label><?= h(LOC('test.task')) ?><br><input type="text" name="task" id="task-input" value="<?= h($taskCode) ?>" list="task-suggest" autocomplete="off" placeholder="<?= h(LOC('test.task_hint')) ?>"></label>
+            <datalist id="task-suggest"></datalist>
             <button type="submit"><?= h(LOC('test.lookup')) ?></button>
             <?php if ($component !== '' && $lookup === null && $woHits === []): ?><p class="muted"><?= h(LOC('test.unknown')) ?></p><?php endif; ?>
             <?php foreach ($woHits as $hit): $wo = $hit['wo_no'] . ($hit['company'] !== '' ? ' (' . $hit['company'] . ')' : ''); ?>
                 <p><?php if ($hit['component_no'] === ''): ?><?= h(LOC('test.wo_no_component', $wo)) ?>
                 <?php elseif ($hit['lookup'] === null): ?><?= h(LOC('test.wo', $wo, $hit['component_no'])) ?><br><span class="muted"><?= h(LOC('test.unknown')) ?></span>
-                <?php else: $m = $hit['lookup']['motor']; ?><?= h(LOC('test.wo', $wo, $hit['component_no'])) ?><br>
+                <?php else: $m = $hit['lookup']['motor']; ?><?= h(LOC('test.wo', $wo, $hit['component_no'])) ?>
+                    <?php if (trim((string) ($hit['task_code'] ?? '')) !== ''): ?> · <?= h(thales_task_label((string) $hit['task_code'])) ?><?php endif; ?><br>
                     <?= $hit['lookup']['role'] === 'SET' ? h(LOC('test.motor', $m['component_no'])) . '<br>' : '' ?><?= h($motorText($m)) ?>
                     <span class="muted">(<?= h(LOC('lib.source', $m['brand_source'])) ?>)</span><?php endif; ?></p>
             <?php endforeach; ?>
@@ -313,11 +347,49 @@ if (isset($_GET['partial']) && (string) $_GET['partial'] === '1') {
                 <p><?= $lookup['role'] === 'SET' ? h(LOC('test.motor', $m['component_no'])) . '<br>' : '' ?><?= h($motorText($m)) ?>
                     <span class="muted">(<?= h(LOC('lib.source', $m['brand_source'])) ?>)</span></p>
             <?php endif; ?>
-            <label><?= h(LOC('test.search')) ?><br><input type="text" name="q" value="<?= h($query) ?>" list="part-suggest" autocomplete="off" autofocus></label>
+            <label><?= h(LOC('test.search')) ?><br><input type="text" name="q" value="<?= h($query) ?>" list="part-suggest" autocomplete="off"<?= $taskCode === '' ? ' autofocus' : '' ?>></label>
             <datalist id="part-suggest"></datalist>
             <button type="submit"><?= h(LOC('button.search')) ?></button>
         </form>
     </section>
+
+    <?php if ($taskOdds !== null): ?>
+    <section>
+        <h2><?= h(LOC('test.odds_title')) ?><?php if ($taskCode !== ''): ?> · <?= h(thales_task_label($taskCode)) ?><?php endif; ?></h2>
+        <?php if ($taskOdds['tasks'] === 0): ?>
+            <p class="muted"><?= h(LOC('test.odds_none')) ?></p>
+        <?php else: ?>
+            <p class="muted"><?= h(LOC($taskOdds['level'] === 'motor+task' ? 'test.odds_level_motor' : 'test.odds_level_task', $taskOdds['tasks'])) ?></p>
+            <div class="part-grid" id="odds-grid">
+            <?php foreach ($taskOdds['parts'] as $p):
+                $modalQs = http_build_query(array_filter([
+                    'tab' => 'library',
+                    'brand' => $motorBrand !== '' ? $motorBrand : null,
+                    'type' => $motorType !== '' ? $motorType : null,
+                    'item' => $p['item_no'],
+                ], static fn($v) => $v !== null && $v !== ''));
+            ?>
+                <div class="part-card odds-card" draggable="true"
+                     data-item="<?= h($p['item_no']) ?>"
+                     data-desc="<?= h($p['description']) ?>"
+                     data-qty="<?= h(thales_fmt_qty($p['qty_median'])) ?>"
+                     data-modal="<?= h($modalQs) ?>">
+                    <span class="part-bar" style="background: hsl(<?= (int) $p['hue'] ?>, 55%, 45%);"></span>
+                    <button type="button" class="odds-add" title="<?= h(LOC('test.nodig_add')) ?>">+</button>
+                    <span class="odds-pct"><?= h(LOC('test.odds_pct', (string) (int) round($p['odds'] * 100))) ?></span>
+                    <strong class="part-name<?= $p['description'] === '' ? ' muted' : '' ?>"><?= h($p['description'] !== '' ? $p['description'] : LOC('lib.no_description')) ?></strong>
+                    <span class="part-no"><?= h($p['item_no']) ?></span>
+                    <span class="muted part-stats"><?= h(LOC('test.odds_n', $p['times'], $taskOdds['tasks'])) ?> · <?= h(LOC('test.odds_qty', thales_fmt_qty($p['qty_median']))) ?></span>
+                    <?php if ($motorBrand !== ''): ?>
+                    <a class="muted" href="?<?= h($modalQs) ?>" data-odds-open="1"><?= h(LOC('test.open_part')) ?></a>
+                    <?php endif; ?>
+                </div>
+            <?php endforeach; ?>
+            </div>
+        <?php endif; ?>
+    </section>
+    <?php endif; ?>
+
     <?php if ($results !== null): foreach (['used' => 'test.used', 'other' => 'test.other'] as $key => $title): if ($key === 'used' && !$lookup) { continue; } ?>
     <section>
         <h2><?= h(LOC($title)) ?></h2>
@@ -331,6 +403,19 @@ if (isset($_GET['partial']) && (string) $_GET['partial'] === '1') {
         <?php endif; ?>
     </section>
     <?php endforeach; endif; ?>
+    </div>
+
+    <aside class="nodig-panel" id="nodig-panel">
+        <section>
+            <h2><?= h(LOC('test.nodig_title')) ?></h2>
+            <p class="muted"><?= h(LOC('test.nodig_hint')) ?></p>
+            <ul class="nodig-list" id="nodig-list"></ul>
+            <p class="muted" id="nodig-empty"><?= h(LOC('test.nodig_empty')) ?></p>
+        </section>
+    </aside>
+    </div>
+
+    <div id="test-modal-mount"></div>
     <script>
     (function () {
         var input = document.querySelector('input[name=component]'), list = document.getElementById('component-suggest'), timer = null, last = '';
@@ -349,9 +434,30 @@ if (isset($_GET['partial']) && (string) $_GET['partial'] === '1') {
                 }, 200);
             });
         }
+        var taskInput = document.getElementById('task-input'), taskList = document.getElementById('task-suggest'), taskTimer = null, taskLast = '';
+        if (taskInput && taskList && window.fetch) {
+            taskInput.addEventListener('input', function () {
+                clearTimeout(taskTimer);
+                taskTimer = setTimeout(function () {
+                    var q = taskInput.value.trim();
+                    if (q === taskLast) { return; }
+                    taskLast = q;
+                    if (q.length < 1) { taskList.innerHTML = ''; return; }
+                    fetch('?suggest_tasks=' + encodeURIComponent(q), { credentials: 'same-origin' }).then(function (r) { return r.json(); }).then(function (rows) {
+                        taskList.innerHTML = '';
+                        rows.forEach(function (row) {
+                            var o = document.createElement('option');
+                            o.value = row.value;
+                            o.label = row.label;
+                            taskList.appendChild(o);
+                        });
+                    }).catch(function () {});
+                }, 200);
+            });
+        }
         var partInput = document.querySelector('input[name=q]'), partList = document.getElementById('part-suggest'), partTimer = null, partLast = '';
-        var brandKey = <?= json_encode((string) ($lookup['motor']['brand_key'] ?? ''), JSON_UNESCAPED_UNICODE) ?>;
-        var typeKey = <?= json_encode((string) ($lookup['motor']['type_key'] ?? ''), JSON_UNESCAPED_UNICODE) ?>;
+        var brandKey = <?= json_encode($motorBrand, JSON_UNESCAPED_UNICODE) ?>;
+        var typeKey = <?= json_encode($motorType, JSON_UNESCAPED_UNICODE) ?>;
         if (partInput && partList && window.fetch) {
             partInput.addEventListener('input', function () {
                 clearTimeout(partTimer);
@@ -374,6 +480,129 @@ if (isset($_GET['partial']) && (string) $_GET['partial'] === '1') {
                 }, 200);
             });
         }
+
+        /* ---- Nodig (localStorage + DnD) ---- */
+        var LS = 'thales-nodig-v1';
+        var panel = document.getElementById('nodig-panel');
+        var ul = document.getElementById('nodig-list');
+        var empty = document.getElementById('nodig-empty');
+        function loadNodig() {
+            try { return JSON.parse(localStorage.getItem(LS) || '[]'); } catch (e) { return []; }
+        }
+        function saveNodig(items) {
+            localStorage.setItem(LS, JSON.stringify(items));
+            renderNodig();
+        }
+        function renderNodig() {
+            var items = loadNodig();
+            ul.innerHTML = '';
+            items.forEach(function (it, idx) {
+                var li = document.createElement('li');
+                li.innerHTML = '<div class="nodig-meta"><strong></strong><div class="part-no"></div><div class="muted"></div></div>';
+                li.querySelector('strong').textContent = it.desc || it.item;
+                li.querySelector('.part-no').textContent = it.item;
+                li.querySelector('.muted').textContent = it.qty ? ('× ' + it.qty) : '';
+                var btn = document.createElement('button');
+                btn.type = 'button';
+                btn.textContent = '×';
+                btn.title = <?= json_encode(LOC('test.nodig_remove'), JSON_UNESCAPED_UNICODE) ?>;
+                btn.addEventListener('click', function () {
+                    var next = loadNodig();
+                    next.splice(idx, 1);
+                    saveNodig(next);
+                });
+                li.appendChild(btn);
+                ul.appendChild(li);
+            });
+            empty.hidden = items.length > 0;
+        }
+        function addNodig(item, desc, qty) {
+            var items = loadNodig();
+            if (items.some(function (x) { return x.item === item; })) { return; }
+            items.push({ item: item, desc: desc || '', qty: qty || '' });
+            saveNodig(items);
+        }
+        renderNodig();
+        if (panel) {
+            panel.addEventListener('dragover', function (e) { e.preventDefault(); panel.classList.add('drag-over'); });
+            panel.addEventListener('dragleave', function () { panel.classList.remove('drag-over'); });
+            panel.addEventListener('drop', function (e) {
+                e.preventDefault();
+                panel.classList.remove('drag-over');
+                try {
+                    var data = JSON.parse(e.dataTransfer.getData('application/json') || '{}');
+                    if (data.item) { addNodig(data.item, data.desc, data.qty); }
+                } catch (err) {}
+            });
+        }
+        document.querySelectorAll('.odds-card').forEach(function (card) {
+            card.addEventListener('dragstart', function (e) {
+                e.dataTransfer.setData('application/json', JSON.stringify({
+                    item: card.getAttribute('data-item'),
+                    desc: card.getAttribute('data-desc'),
+                    qty: card.getAttribute('data-qty')
+                }));
+                e.dataTransfer.effectAllowed = 'copy';
+            });
+            var plus = card.querySelector('.odds-add');
+            if (plus) {
+                plus.addEventListener('click', function (e) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    addNodig(card.getAttribute('data-item'), card.getAttribute('data-desc'), card.getAttribute('data-qty'));
+                });
+            }
+        });
+
+        /* ---- Modal open vanaf kanskaart (zelfde partial als Bibliotheek) ---- */
+        var mount = document.getElementById('test-modal-mount');
+        function overlay() { return document.getElementById('parts-modal'); }
+        function bindOverlay(el) {
+            if (!el || el.dataset.bound === '1') { return; }
+            el.dataset.bound = '1';
+            document.body.style.overflow = 'hidden';
+            var closer = el.querySelector('.modal-close');
+            if (closer) {
+                closer.addEventListener('click', function (e) {
+                    e.preventDefault();
+                    el.hidden = true;
+                    document.body.style.overflow = '';
+                });
+            }
+            el.addEventListener('click', function (e) {
+                if (e.target === el) { el.hidden = true; document.body.style.overflow = ''; }
+            });
+        }
+        function openModal(qs) {
+            if (!qs || !window.fetch || !mount) { return; }
+            var url = '?' + qs + (qs.indexOf('partial=') === -1 ? '&partial=1' : '');
+            fetch(url, { credentials: 'same-origin', headers: { 'Accept': 'text/html' } })
+                .then(function (r) { if (!r.ok) { throw new Error('modal'); } return r.text(); })
+                .then(function (html) {
+                    var wrap = document.createElement('div');
+                    wrap.innerHTML = String(html).trim();
+                    var next = wrap.firstElementChild;
+                    if (!next) { return; }
+                    var cur = overlay();
+                    if (cur) { cur.replaceWith(next); } else { mount.appendChild(next); }
+                    next.hidden = false;
+                    bindOverlay(next);
+                }).catch(function () { location.href = '?' + qs; });
+        }
+        document.addEventListener('click', function (e) {
+            var a = e.target.closest && e.target.closest('a[data-odds-open]');
+            if (!a) { return; }
+            if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) { return; }
+            e.preventDefault();
+            var card = a.closest('.odds-card');
+            openModal(card ? card.getAttribute('data-modal') : '');
+        });
+        document.addEventListener('keydown', function (e) {
+            if (e.key === 'Escape') {
+                var el = overlay();
+                if (el && !el.hidden) { el.hidden = true; document.body.style.overflow = ''; }
+            }
+        });
     })();
     </script>
 <?php endif; ?>

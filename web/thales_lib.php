@@ -40,11 +40,15 @@ const THALES_BC_WORKORDER_DEFAULT = [
     'companies' => ['Koninklijke van Twist', 'Hunter van Twist'], // exacte BC-namen (zoals Daedalus)
     'key' => 'No',                 // werkordernummer, bijv. '4085191' of 'WO2600033' (uniek per bedrijf)
     'component' => 'Component_No', // componentnummer; leeg is normaal (8–25%)
+    'task_code' => 'Task_Code',           // vaste lijst (Ariadne 05-11-2026)
+    'task_description' => 'Task_Description', // vrije tekst; terugval / labels
     'created' => 'Created_On',     // altijd gevuld: backfill per maand + delta
     'start' => 'Start_Date',       // tweede delta-query (kan 0001-01-01 zijn)
     'min_date' => '2002-01-01',    // ondergrens backfill
     'delta_days' => 31,
 ];
+/** Onder dit aantal taken (motortype+taakcode) val kansberekening terug op taakcode over alle motoren. */
+const THALES_TASK_ODDS_MIN_TASKS = 3;
 /** Mímir accepteert max. top 10000; top 0 loopt vast. Deel groter dan dit wordt verder opgesplitst. */
 const THALES_MIMIR_CHUNK = 5000;
 /** Tekens waarop een te groot deel verder wordt gesplitst; ook leestekens, want BC-nummers als 'KO-…' en 'PK-…' gaan na het voorvoegsel verder met '-'. */
@@ -154,14 +158,24 @@ CREATE TABLE IF NOT EXISTS components (component_no TEXT PRIMARY KEY, parent_no 
 CREATE INDEX IF NOT EXISTS comp_parent ON components(parent_no);
 CREATE TABLE IF NOT EXISTS report_motor (item_id TEXT PRIMARY KEY, component_no TEXT, brand_key TEXT, brand TEXT,
     type_key TEXT, type TEXT, brand_source TEXT);
-CREATE TABLE IF NOT EXISTS workorders (company TEXT NOT NULL, wo_no TEXT NOT NULL, component_no TEXT, created_on TEXT, start_date TEXT, synced_at TEXT,
+CREATE TABLE IF NOT EXISTS workorders (company TEXT NOT NULL, wo_no TEXT NOT NULL, component_no TEXT, task_code TEXT NOT NULL DEFAULT '', task_description TEXT NOT NULL DEFAULT '', created_on TEXT, start_date TEXT, synced_at TEXT,
     PRIMARY KEY (company, wo_no));
 CREATE INDEX IF NOT EXISTS wo_no ON workorders(wo_no);
+CREATE INDEX IF NOT EXISTS wo_task ON workorders(task_code);
 CREATE TABLE IF NOT EXISTS items (item_no TEXT PRIMARY KEY, description TEXT, excel_name TEXT NOT NULL DEFAULT '', bc_type TEXT NOT NULL DEFAULT '', is_task INTEGER NOT NULL DEFAULT 0, search TEXT, synced_at TEXT);
 CREATE TABLE IF NOT EXISTS usage (
     brand_key TEXT, brand TEXT, type_key TEXT, type TEXT, brand_source TEXT, item_no TEXT, times_used INTEGER, qty_total REAL,
     PRIMARY KEY (brand_key, type_key, item_no));
 CREATE TABLE IF NOT EXISTS resources (resource_no TEXT PRIMARY KEY, name TEXT, synced_at TEXT);
+CREATE TABLE IF NOT EXISTS task_parts (
+    company TEXT NOT NULL, wo_no TEXT NOT NULL, task_code TEXT NOT NULL,
+    brand_key TEXT NOT NULL DEFAULT '', type_key TEXT NOT NULL DEFAULT '',
+    item_no TEXT NOT NULL, qty REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (company, wo_no, item_no));
+CREATE INDEX IF NOT EXISTS tp_task_motor ON task_parts(task_code, brand_key, type_key);
+CREATE TABLE IF NOT EXISTS task_code_labels (
+    task_code TEXT NOT NULL, description TEXT NOT NULL, times INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (task_code, description));
 SQL);
     thales_migrate($pdo);
     return $pdo;
@@ -193,6 +207,26 @@ function thales_migrate(PDO $pdo): void
         item_no TEXT NOT NULL, name TEXT NOT NULL, times INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (item_no, name))');
     $pdo->exec('CREATE TABLE IF NOT EXISTS resources (resource_no TEXT PRIMARY KEY, name TEXT, synced_at TEXT)');
+    $woCols = array_column($pdo->query('PRAGMA table_info(workorders)')->fetchAll(), 'name');
+    if (!in_array('task_code', $woCols, true)) {
+        $pdo->exec("ALTER TABLE workorders ADD COLUMN task_code TEXT NOT NULL DEFAULT ''");
+        $pdo->exec("ALTER TABLE workorders ADD COLUMN task_description TEXT NOT NULL DEFAULT ''");
+        // Eenmalige her-lees van Task_Code/Description, verdeeld over nachten (zelfde maand-patroon).
+        foreach ($pdo->query("SELECT DISTINCT company FROM workorders")->fetchAll(PDO::FETCH_COLUMN) as $co) {
+            $pdo->prepare('DELETE FROM state WHERE key = ?')->execute(['workorders_taskfill_done|' . $co]);
+            $pdo->prepare('DELETE FROM state WHERE key = ?')->execute(['workorders_taskfill_oldest_month|' . $co]);
+        }
+    }
+    $pdo->exec('CREATE INDEX IF NOT EXISTS wo_task ON workorders(task_code)');
+    $pdo->exec("CREATE TABLE IF NOT EXISTS task_parts (
+        company TEXT NOT NULL, wo_no TEXT NOT NULL, task_code TEXT NOT NULL,
+        brand_key TEXT NOT NULL DEFAULT '', type_key TEXT NOT NULL DEFAULT '',
+        item_no TEXT NOT NULL, qty REAL NOT NULL DEFAULT 0,
+        PRIMARY KEY (company, wo_no, item_no))");
+    $pdo->exec('CREATE INDEX IF NOT EXISTS tp_task_motor ON task_parts(task_code, brand_key, type_key)');
+    $pdo->exec('CREATE TABLE IF NOT EXISTS task_code_labels (
+        task_code TEXT NOT NULL, description TEXT NOT NULL, times INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (task_code, description))');
 }
 
 /** Rapport na een harde crash of fatale fout op de retry-lijst zetten (na een week: given_up). */
@@ -837,13 +871,17 @@ function thales_bc_workorder_config(): array
 function thales_store_workorders(string $company, string $filter, string $today): int
 {
     $cfg = thales_bc_workorder_config();
-    $select = [$cfg['key'], $cfg['component'], $cfg['created'], $cfg['start']];
-    $ins = thales_db()->prepare('INSERT OR REPLACE INTO workorders(company, wo_no, component_no, created_on, start_date, synced_at) VALUES(?, ?, ?, ?, ?, ?)');
+    $select = [$cfg['key'], $cfg['component'], $cfg['task_code'], $cfg['task_description'], $cfg['created'], $cfg['start']];
+    $ins = thales_db()->prepare('INSERT OR REPLACE INTO workorders(company, wo_no, component_no, task_code, task_description, created_on, start_date, synced_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?)');
     $onRow = static function (array $row) use ($ins, $cfg, $today, $company): void {
         $no = strtoupper(trim((string) ($row[$cfg['key']] ?? '')));
         if ($no !== '') {
-            $ins->execute([$company, $no, strtoupper(trim((string) ($row[$cfg['component']] ?? ''))),
-                substr((string) ($row[$cfg['created']] ?? ''), 0, 10), substr((string) ($row[$cfg['start']] ?? ''), 0, 10), $today]);
+            $ins->execute([
+                $company, $no, strtoupper(trim((string) ($row[$cfg['component']] ?? ''))),
+                strtoupper(trim((string) ($row[$cfg['task_code']] ?? ''))),
+                trim((string) ($row[$cfg['task_description']] ?? '')),
+                substr((string) ($row[$cfg['created']] ?? ''), 0, 10), substr((string) ($row[$cfg['start']] ?? ''), 0, 10), $today,
+            ]);
         }
     };
     $rows = thales_mimir_query((string) $cfg['entity'], $select, $filter, THALES_MIMIR_CHUNK, $company);
@@ -917,6 +955,27 @@ function thales_sync_workorders(): string
                 }
                 $line .= ', backfill ' . $month->format('Y-m') . ': ' . $b . ($done ? ' (klaar)' : ' (tot ' . $end . ')');
             }
+            // Eenmalige Task_Code/Description-herlees voor bestaande rijen (1 maand/nacht).
+            if (thales_state('workorders_taskfill_done|' . $company) !== '1') {
+                $end = thales_state('workorders_backfill_end|' . $company)
+                    ?? thales_state('workorders_taskfill_end|' . $company);
+                if ($end === null) {
+                    $end = thales_workorder_oldest_month($company, $now) ?? $now->format('Y-m');
+                    $end = max($end, substr((string) $cfg['min_date'], 0, 7));
+                    thales_set_state('workorders_taskfill_end|' . $company, $end);
+                }
+                $oldest = thales_state('workorders_taskfill_oldest_month|' . $company);
+                $month = $oldest === null ? new DateTimeImmutable($now->format('Y-m') . '-01', $tz)
+                    : (new DateTimeImmutable($oldest . '-01', $tz))->modify('-1 month');
+                $filter = $cfg['created'] . ' ge ' . $month->format('Y-m-d') . ' and ' . $cfg['created'] . ' lt ' . $month->modify('+1 month')->format('Y-m-d');
+                $t = thales_store_workorders($company, $filter, $today);
+                thales_set_state('workorders_taskfill_oldest_month|' . $company, $month->format('Y-m'));
+                $done = $month->format('Y-m') <= $end;
+                if ($done) {
+                    thales_set_state('workorders_taskfill_done|' . $company, '1');
+                }
+                $line .= ', taskfill ' . $month->format('Y-m') . ': ' . $t . ($done ? ' (klaar)' : '');
+            }
             $db->commit();
         } catch (Throwable $e) {
             $db->rollBack();
@@ -936,16 +995,22 @@ function thales_sync_workorders(): string
 function thales_workorder_components(string $woNo): array
 {
     $no = strtoupper(trim($woNo));
-    $stmt = thales_db()->prepare('SELECT company, wo_no, component_no FROM workorders WHERE wo_no = ? ORDER BY company');
+    $stmt = thales_db()->prepare('SELECT company, wo_no, component_no, task_code, task_description FROM workorders WHERE wo_no = ? ORDER BY company');
     $stmt->execute([$no]);
     $hits = $stmt->fetchAll();
     if ($hits === []) {
-        $stmt = thales_db()->prepare("SELECT '' company, UPPER(wo) wo_no, UPPER(equipment_no) component_no FROM reports
+        $stmt = thales_db()->prepare("SELECT '' company, UPPER(wo) wo_no, UPPER(equipment_no) component_no, '' task_code, '' task_description FROM reports
             WHERE UPPER(wo) = ? AND COALESCE(equipment_no, '') <> '' ORDER BY report_date DESC LIMIT 1");
         $stmt->execute([$no]);
         $hits = $stmt->fetchAll();
     }
-    return array_map(static fn(array $h) => ['company' => (string) $h['company'], 'wo_no' => (string) $h['wo_no'], 'component_no' => (string) $h['component_no']], $hits);
+    return array_map(static fn(array $h) => [
+        'company' => (string) $h['company'],
+        'wo_no' => (string) $h['wo_no'],
+        'component_no' => (string) $h['component_no'],
+        'task_code' => (string) ($h['task_code'] ?? ''),
+        'task_description' => (string) ($h['task_description'] ?? ''),
+    ], $hits);
 }
 
 /**
@@ -1067,7 +1132,225 @@ function thales_rebuild_aggregates(): void
         SELECT name FROM item_excel_names x WHERE x.item_no = items.item_no ORDER BY times DESC, name LIMIT 1
     ), '')");
     $db->commit();
+    thales_rebuild_task_parts();
     thales_refresh_item_search();
+}
+
+/**
+ * Per werkorder (company+No) de onderdelen uit gekoppelde servicerapporten bewaren, plus taakcode-labels.
+ * Koppeling rapport→WO: reports.wo = workorders.wo_no; bij meerdere bedrijven: componentmatch prefereert.
+ */
+function thales_rebuild_task_parts(): void
+{
+    $db = thales_db();
+    $db->beginTransaction();
+    $db->exec('DELETE FROM task_parts; DELETE FROM task_code_labels;');
+    $ins = $db->prepare('INSERT OR REPLACE INTO task_parts(company, wo_no, task_code, brand_key, type_key, item_no, qty)
+        VALUES(?, ?, ?, ?, ?, ?, ?)');
+    $lab = $db->prepare('INSERT INTO task_code_labels(task_code, description, times) VALUES(?, ?, 1)
+        ON CONFLICT(task_code, description) DO UPDATE SET times = times + 1');
+    foreach ($db->query("SELECT company, wo_no, component_no, task_code, task_description FROM workorders WHERE TRIM(task_code) != ''") as $wo) {
+        $code = strtoupper(trim((string) $wo['task_code']));
+        $desc = trim((string) $wo['task_description']);
+        if ($desc !== '') {
+            $lab->execute([$code, $desc]);
+        }
+        // Rapporten met dit WO-nummer; kies bedrijf via component als er meerdere WO-rijen zijn.
+        $reps = $db->prepare("SELECT r.item_id, r.equipment_no, m.brand_key, m.type_key, m.component_no motor_no
+            FROM reports r
+            LEFT JOIN report_motor m ON m.item_id = r.item_id
+            WHERE r.parse_status = 'ok' AND UPPER(COALESCE(r.wo, '')) = ?");
+        $reps->execute([(string) $wo['wo_no']]);
+        $matched = false;
+        foreach ($reps->fetchAll() as $rep) {
+            $eq = strtoupper(trim((string) ($rep['equipment_no'] ?? '')));
+            $motor = strtoupper(trim((string) ($rep['motor_no'] ?? '')));
+            $comp = strtoupper(trim((string) $wo['component_no']));
+            // Preferente match: equipment of motor = WO-component; anders accepteren als enig bedrijf of leeg component.
+            if ($comp !== '' && $eq !== $comp && $motor !== $comp) {
+                // Andere bedrijven met zelfde WO+component? Skip als dit bedrijf niet matcht.
+                $others = $db->prepare('SELECT COUNT(*) FROM workorders WHERE wo_no = ? AND company != ? AND (
+                    UPPER(COALESCE(component_no,\'\')) = ? OR UPPER(COALESCE(component_no,\'\')) = ?)');
+                $others->execute([(string) $wo['wo_no'], (string) $wo['company'], $eq, $motor]);
+                if ((int) $others->fetchColumn() > 0) {
+                    continue;
+                }
+            }
+            $matched = true;
+            $brand = (string) ($rep['brand_key'] ?? '');
+            $type = (string) ($rep['type_key'] ?? '');
+            $parts = $db->prepare('SELECT item_no, qty FROM report_parts WHERE item_id = ?');
+            $parts->execute([(string) $rep['item_id']]);
+            foreach ($parts->fetchAll() as $p) {
+                $no = strtoupper(trim((string) $p['item_no']));
+                if ($no === '') {
+                    continue;
+                }
+                $itemStmt = $db->prepare('SELECT item_no, bc_type, is_task FROM items WHERE item_no = ?');
+                $itemStmt->execute([$no]);
+                $itemRow = $itemStmt->fetch() ?: null;
+                if (thales_item_is_ignored($itemRow, $no)) {
+                    continue;
+                }
+                // Bestaande qty optellen (meerdere rapporten per WO).
+                $prev = $db->prepare('SELECT qty FROM task_parts WHERE company = ? AND wo_no = ? AND item_no = ?');
+                $prev->execute([(string) $wo['company'], (string) $wo['wo_no'], $no]);
+                $oldQty = $prev->fetchColumn();
+                $qty = (float) $p['qty'] + ($oldQty === false ? 0.0 : (float) $oldQty);
+                $ins->execute([(string) $wo['company'], (string) $wo['wo_no'], $code, $brand, $type, $no, $qty]);
+            }
+        }
+        unset($matched);
+    }
+    $db->commit();
+}
+
+/**
+ * Mediaan van een lijst floats (lege lijst → 0).
+ * @param list<float|int> $values
+ */
+function thales_median(array $values): float
+{
+    $n = count($values);
+    if ($n === 0) {
+        return 0.0;
+    }
+    sort($values, SORT_NUMERIC);
+    $mid = intdiv($n, 2);
+    return $n % 2 === 1 ? (float) $values[$mid] : ((float) $values[$mid - 1] + (float) $values[$mid]) / 2.0;
+}
+
+/**
+ * Kans per artikel voor taakcode (+ optioneel motor). Fallback naar alleen taakcode als motor+taak te dun is.
+ * @return array{level:string,tasks:int,parts:list<array{item_no:string,description:string,odds:float,times:int,qty_median:float,hue:int}>}
+ */
+function thales_task_odds(string $taskCode, string $brandKey = '', string $typeKey = ''): array
+{
+    $code = strtoupper(trim($taskCode));
+    if ($code === '') {
+        return ['level' => 'none', 'tasks' => 0, 'parts' => []];
+    }
+    $db = thales_db();
+    $vis = thales_sql_item_visible('i', 'tp.item_no');
+    $useMotor = $brandKey !== '' && $typeKey !== '';
+    $scope = static function (bool $motor) use ($db, $code, $brandKey, $typeKey): array {
+        if ($motor) {
+            $stmt = $db->prepare('SELECT company, wo_no FROM task_parts WHERE task_code = ? AND brand_key = ? AND type_key = ? GROUP BY company, wo_no');
+            $stmt->execute([$code, $brandKey, $typeKey]);
+        } else {
+            $stmt = $db->prepare('SELECT company, wo_no FROM task_parts WHERE task_code = ? GROUP BY company, wo_no');
+            $stmt->execute([$code]);
+        }
+        return $stmt->fetchAll();
+    };
+    $tasks = $useMotor ? $scope(true) : [];
+    $level = 'motor+task';
+    if (count($tasks) < THALES_TASK_ODDS_MIN_TASKS) {
+        $tasks = $scope(false);
+        $level = 'task';
+        $useMotor = false;
+    }
+    $n = count($tasks);
+    if ($n === 0) {
+        return ['level' => 'none', 'tasks' => 0, 'parts' => []];
+    }
+    if ($useMotor) {
+        $stmt = $db->prepare("SELECT tp.item_no,
+            COALESCE(NULLIF(TRIM(i.description), ''), NULLIF(TRIM(i.excel_name), ''), '') description,
+            COUNT(DISTINCT tp.company || '|' || tp.wo_no) times,
+            GROUP_CONCAT(tp.qty) qtys
+            FROM task_parts tp LEFT JOIN items i ON i.item_no = tp.item_no
+            WHERE tp.task_code = ? AND tp.brand_key = ? AND tp.type_key = ? AND $vis
+            GROUP BY tp.item_no");
+        $stmt->execute([$code, $brandKey, $typeKey]);
+    } else {
+        $stmt = $db->prepare("SELECT tp.item_no,
+            COALESCE(NULLIF(TRIM(i.description), ''), NULLIF(TRIM(i.excel_name), ''), '') description,
+            COUNT(DISTINCT tp.company || '|' || tp.wo_no) times,
+            GROUP_CONCAT(tp.qty) qtys
+            FROM task_parts tp LEFT JOIN items i ON i.item_no = tp.item_no
+            WHERE tp.task_code = ? AND $vis
+            GROUP BY tp.item_no");
+        $stmt->execute([$code]);
+    }
+    $parts = [];
+    foreach ($stmt->fetchAll() as $row) {
+        if (thales_item_is_ignored(null, (string) $row['item_no'])) {
+            continue;
+        }
+        $qtys = array_map('floatval', array_filter(explode(',', (string) $row['qtys']), static fn($v) => $v !== ''));
+        $times = (int) $row['times'];
+        $desc = (string) $row['description'];
+        $parts[] = [
+            'item_no' => (string) $row['item_no'],
+            'description' => $desc,
+            'odds' => $n > 0 ? round($times / $n, 4) : 0.0,
+            'times' => $times,
+            'qty_median' => thales_median($qtys),
+            'hue' => thales_part_hue($desc, (string) $row['item_no']),
+        ];
+    }
+    usort($parts, static fn($a, $b): int => [$b['odds'], $b['times'], $b['qty_median']] <=> [$a['odds'], $a['times'], $a['qty_median']]);
+    return ['level' => $level, 'tasks' => $n, 'parts' => $parts];
+}
+
+/**
+ * Fuzzy suggestie van taakcodes via labels (Task_Description) en de code zelf.
+ * @return list<array{value:string,label:string,score:float}>
+ */
+function thales_suggest_tasks(string $query, int $limit = 20): array
+{
+    $q = trim($query);
+    if ($q === '') {
+        return [];
+    }
+    $db = thales_db();
+    $rows = $db->query('SELECT task_code, description, times FROM task_code_labels')->fetchAll();
+    // Ook codes zonder label (nog geen description in cache).
+    foreach ($db->query("SELECT DISTINCT task_code FROM workorders WHERE TRIM(task_code) != ''") as $r) {
+        $rows[] = ['task_code' => $r['task_code'], 'description' => '', 'times' => 0];
+    }
+    $best = [];
+    foreach ($rows as $row) {
+        $code = strtoupper(trim((string) $row['task_code']));
+        if ($code === '') {
+            continue;
+        }
+        $desc = trim((string) $row['description']);
+        $hay = $code . ' ' . $desc;
+        $score = thales_fuzzy_score($q, $hay);
+        if (strcasecmp($q, $code) === 0) {
+            $score = 1.0;
+        } elseif (str_starts_with(strtoupper($code), strtoupper($q))) {
+            $score = max($score, 0.95);
+        }
+        if ($score < 0.5) {
+            continue;
+        }
+        $prev = $best[$code]['score'] ?? 0.0;
+        if ($score >= $prev) {
+            $label = $desc !== '' ? $code . ' — ' . $desc : $code;
+            $best[$code] = ['value' => $code, 'label' => $label, 'score' => $score, 'times' => (int) $row['times']];
+        }
+    }
+    $out = array_values($best);
+    usort($out, static fn($a, $b): int => [$b['score'], $b['times']] <=> [$a['score'], $a['times']]);
+    return array_map(static fn($r) => ['value' => $r['value'], 'label' => $r['label'], 'score' => $r['score']], array_slice($out, 0, max(1, $limit)));
+}
+
+/**
+ * Meest voorkomende label voor een taakcode (of de code zelf).
+ */
+function thales_task_label(string $taskCode): string
+{
+    $code = strtoupper(trim($taskCode));
+    if ($code === '') {
+        return '';
+    }
+    $stmt = thales_db()->prepare('SELECT description FROM task_code_labels WHERE task_code = ? ORDER BY times DESC, description LIMIT 1');
+    $stmt->execute([$code]);
+    $desc = trim((string) ($stmt->fetchColumn() ?: ''));
+    return $desc !== '' ? $code . ' — ' . $desc : $code;
 }
 
 /** Zoektekst van artikelen verversen: artikelnr + BC-naam + alle Excel-namen. */

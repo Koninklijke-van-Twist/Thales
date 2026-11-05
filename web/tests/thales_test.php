@@ -152,12 +152,14 @@ $GLOBALS['THALES_MIMIR'] = function (string $table, array $select, string $filte
             return $mm[1] > $prev ? [['No' => 'X']] : [];
         }
         if (str_contains($filter, ' lt ')) { // backfill op Created_On: één maand
-            return str_contains($filter, 'Created_On ge ' . $prev) && $company === 'KvT' ? [['No' => 'WO2500001', 'Component_No' => '90000001', 'Created_On' => $prev, 'Start_Date' => '0001-01-01']] : [];
+            return str_contains($filter, 'Created_On ge ' . $prev) && $company === 'KvT'
+                ? [['No' => 'WO2500001', 'Component_No' => '90000001', 'Task_Code' => 'GOH', 'Task_Description' => 'Preventive maintenance', 'Created_On' => $prev, 'Start_Date' => '0001-01-01']]
+                : [];
         }
         if (str_starts_with($filter, 'Start_Date')) {
-            return [['No' => 'WO2600098', 'Component_No' => '', 'Created_On' => '2020-01-01', 'Start_Date' => date('Y-m-d')]];
+            return [['No' => 'WO2600098', 'Component_No' => '', 'Task_Code' => 'ST', 'Task_Description' => 'Storingsdiagnose', 'Created_On' => '2020-01-01', 'Start_Date' => date('Y-m-d')]];
         }
-        return [['No' => 'WO2600099', 'Component_No' => $company === 'KvT' ? '90000002' : '90000001', 'Created_On' => date('Y-m-d'), 'Start_Date' => '0001-01-01']];
+        return [['No' => 'WO2600099', 'Component_No' => $company === 'KvT' ? '90000002' : '90000001', 'Task_Code' => 'CO', 'Task_Description' => 'Correctief onderhoud', 'Created_On' => date('Y-m-d'), 'Start_Date' => '0001-01-01']];
     }
     return [];
 };
@@ -237,7 +239,7 @@ check(thales_state('workorders_backfill_oldest_month|KvT') === $cur && thales_st
 $hits = thales_workorder_components('wo2600099');
 check(count($hits) === 2 && $hits[0]['company'] === 'HvT' && $hits[0]['component_no'] === '90000001' && $hits[1]['component_no'] === '90000002', 'zelfde nummer in twee bedrijven: beide treffers');
 check(thales_workorder_components('WO2600098')[0]['component_no'] === '' && count(thales_workorder_components('WO2600098')) === 2, 'delta op Start_Date; leeg component bewaard');
-check(thales_workorder_components('WO2600001') === [['company' => '', 'wo_no' => 'WO2600001', 'component_no' => '90000001']], 'werkorder uit rapport als fallback');
+check(thales_workorder_components('WO2600001') === [['company' => '', 'wo_no' => 'WO2600001', 'component_no' => '90000001', 'task_code' => '', 'task_description' => '']], 'werkorder uit rapport als fallback');
 $sugg = array_column(thales_suggest('wo26'), 'value');
 check(in_array('werkorder HvT,werkorder KvT', array_column(thales_suggest('WO2600099'), 'kind'), true) && in_array('WO2600099', $sugg, true) && in_array('WO2600001', $sugg, true) && array_column(thales_suggest('9000'), 'value') === ['90000001', '90000002', '90000003'], 'autocomplete prefix op werkorders en componenten');
 check(thales_suggest('%') === [] && count(thales_suggest('9', 1)) === 1, 'autocomplete: % letterlijk, limiet');
@@ -268,5 +270,50 @@ $deltaPages = [['value' => [], '@odata.nextLink' => 'https://g/delta?page=x']];
 $s2 = thales_nightly(0);
 check($s2['status'] === 'partial', 'zonder budget: partial, dag-index blijft staan');
 check(is_file($GLOBALS['THALES_DATA_DIR'] . '/.htaccess'), 'data/.htaccess aangemaakt');
+
+
+// ---------- taakcode: opslag, labels, kans + fallback
+$wo99 = thales_workorder_components('WO2600099');
+check(($wo99[0]['task_code'] ?? '') === 'CO' && ($wo99[1]['task_code'] ?? '') === 'CO', 'werkorder bewaart Task_Code');
+check(thales_state('workorders_taskfill_oldest_month|KvT') !== null, 'taskfill: eerste nacht heeft een maand gelezen');
+// Koppel rapport WO2600001 aan KvT-werkorder met taakcode + bouw task_parts handmatig uit meerdere WO's
+$db->exec("INSERT OR REPLACE INTO workorders(company, wo_no, component_no, task_code, task_description, created_on, start_date, synced_at) VALUES
+    ('KvT', 'WO2600001', '90000001', 'CO', 'Correctief onderhoud', '2026-01-01', '2026-01-01', '2026-01-01'),
+    ('KvT', 'WO260000A', '90000001', 'CO', 'Correctief onderhoud', '2026-01-02', '2026-01-02', '2026-01-01'),
+    ('KvT', 'WO260000B', '90000001', 'CO', 'Correctief', '2026-01-03', '2026-01-03', '2026-01-01'),
+    ('KvT', 'WO260000C', '90000001', 'CO', 'Correctief', '2026-01-04', '2026-01-04', '2026-01-01'),
+    ('KvT', 'WO260000D', '90000002', 'GOH', 'Preventive maintenance', '2026-01-05', '2026-01-05', '2026-01-01')");
+// Zorg dat report A (WO2600001) in task_parts belandt: rebuild
+thales_rebuild_aggregates();
+// synthetische task_parts voor kansberekening (4 CO-taken op PERKINS/4016TAG2A)
+$db->exec("DELETE FROM task_parts");
+$db->exec("INSERT INTO task_parts(company, wo_no, task_code, brand_key, type_key, item_no, qty) VALUES
+    ('KvT', 'WO2600001', 'CO', 'PERKINS', '4016TAG2A', 'TST-1', 4),
+    ('KvT', 'WO260000A', 'CO', 'PERKINS', '4016TAG2A', 'TST-1', 2),
+    ('KvT', 'WO260000A', 'CO', 'PERKINS', '4016TAG2A', 'TST-2', 1),
+    ('KvT', 'WO260000B', 'CO', 'PERKINS', '4016TAG2A', 'TST-1', 4),
+    ('KvT', 'WO260000C', 'CO', 'PERKINS', '4016TAG2A', 'TST-2', 3),
+    ('KvT', 'WO260000D', 'GOH', 'PERKINS', '4016TAG2A', 'TST-1', 1),
+    ('KvT', 'WO-THIN-1', 'SA', 'OTHER', 'X', 'TST-3', 1)");
+$db->exec("DELETE FROM task_code_labels");
+$db->exec("INSERT INTO task_code_labels(task_code, description, times) VALUES
+    ('CO', 'Correctief onderhoud', 3),
+    ('GOH', 'Preventive maintenance', 1),
+    ('SA', 'Smeerolie analyse', 1)");
+$odds = thales_task_odds('CO', 'PERKINS', '4016TAG2A');
+check($odds['level'] === 'motor+task' && $odds['tasks'] === 4, 'kans: 4 CO-taken op dit motortype');
+$byItem = array_column($odds['parts'], null, 'item_no');
+check(isset($byItem['TST-1']) && abs($byItem['TST-1']['odds'] - 0.75) < 0.001 && $byItem['TST-1']['times'] === 3, 'TST-1 in 3/4 = 75%');
+check(isset($byItem['TST-2']) && abs($byItem['TST-2']['odds'] - 0.5) < 0.001, 'TST-2 in 2/4 = 50%');
+check(abs($byItem['TST-1']['qty_median'] - 4.0) < 0.01, 'mediaan qty TST-1 = 4 (2,4,4)');
+// Te weinig data op motor+taak → fallback taakbreed
+$thin = thales_task_odds('SA', 'PERKINS', '4016TAG2A');
+check($thin['level'] === 'task' && $thin['tasks'] === 1 && ($thin['parts'][0]['item_no'] ?? '') === 'TST-3', 'fallback naar taakcode over alle motoren');
+check(thales_median([1, 3, 2]) === 2.0 && thales_median([1, 2, 3, 4]) === 2.5 && thales_median([]) === 0.0, 'mediaan helper');
+$sug = thales_suggest_tasks('correctief');
+check(($sug[0]['value'] ?? '') === 'CO', 'suggest_tasks fuzzy op omschrijving → CO');
+$sug2 = thales_suggest_tasks('goh');
+check(($sug2[0]['value'] ?? '') === 'GOH', 'suggest_tasks prefix op code');
+check(str_contains(thales_task_label('CO'), 'Correctief'), 'task_label toont omschrijving');
 
 echo "Alle tests geslaagd\n";
