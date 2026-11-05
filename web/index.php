@@ -98,6 +98,10 @@ $results = $tab === 'test' && ($query !== '' || $lookup) ? thales_search($query,
         .part-name.muted { font-weight: 400; font-style: italic; }
         .part-no { font-variant-numeric: tabular-nums; }
         .part-stats { font-size: .8rem; }
+        .type-grid { grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 8px; }
+        .type-card { padding: 0 8px 6px; gap: 2px; }
+        .type-card .part-bar { height: 4px; margin: 0 -8px 4px; }
+        .type-card .part-name { font-size: .9rem; }
         .part-sources { grid-column: 1 / -1; background: var(--kvt-row-ok); border-radius: 8px; padding: 10px 12px; }
         @media (max-width: 600px) { .part-grid { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); } }
         .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.45); display: flex; align-items: flex-start; justify-content: center; padding: 4vh 12px; z-index: 1000; }
@@ -127,11 +131,15 @@ $results = $tab === 'test' && ($query !== '' || $lookup) ? thales_search($query,
         <?php if ($brands === []): ?><p class="muted"><?= h(LOC('lib.empty')) ?></p><?php endif; ?>
         <?php foreach ($brands as $b): ?>
             <h3><?= h($b['brand']) ?></h3>
-            <p class="types">
-            <?php foreach ($b['types'] as $t): $sel = $b['brand_key'] === $brandKey && $t['type_key'] === $typeKey; ?>
-                <a class="<?= $sel ? 'sel' : '' ?>" href="?<?= h(http_build_query(['tab' => 'library', 'brand' => $b['brand_key'], 'type' => $t['type_key']])) ?>"><?= h($t['type'] !== '' ? $t['type'] : LOC('lib.type_unknown')) ?></a>
+            <div class="part-grid type-grid">
+            <?php foreach ($b['types'] as $t): $sel = $b['brand_key'] === $brandKey && $t['type_key'] === $typeKey; $hue = crc32($b['brand_key'] . '|' . $t['type_key']) % 360; ?>
+                <a class="part-card type-card<?= $sel ? ' active' : '' ?>" href="?<?= h(http_build_query(['tab' => 'library', 'brand' => $b['brand_key'], 'type' => $t['type_key']])) ?>">
+                    <span class="part-bar" style="background: hsl(<?= (int) $hue ?>, 55%, 45%);"></span>
+                    <strong class="part-name<?= $t['type'] === '' ? ' muted' : '' ?>"><?= h($t['type'] !== '' ? $t['type'] : LOC('lib.type_unknown')) ?></strong>
+                    <span class="muted part-stats"><?= h(LOC('lib.parts_count', (string) (int) $t['parts'])) ?></span>
+                </a>
             <?php endforeach; ?>
-            </p>
+            </div>
         <?php endforeach; ?>
     </section>
     <?php if ($brandKey !== ''): $parts = thales_parts($brandKey, $typeKey); ?>

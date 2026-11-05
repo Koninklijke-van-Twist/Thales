@@ -977,11 +977,11 @@ function thales_status(): array
 /** @return list<array{brand_key:string,brand:string,types:list<array{type_key:string,type:string}>}> */
 function thales_brands(): array
 {
-    $rows = thales_db()->query('SELECT brand_key, MAX(brand) brand, type_key, MAX(type) type FROM usage GROUP BY brand_key, type_key ORDER BY brand_key = \'?\', brand, type_key')->fetchAll();
+    $rows = thales_db()->query('SELECT brand_key, MAX(brand) brand, type_key, MAX(type) type, COUNT(*) parts FROM usage GROUP BY brand_key, type_key ORDER BY brand_key = \'?\', brand, type_key')->fetchAll();
     $out = [];
     foreach ($rows as $row) {
         $out[$row['brand_key']] ??= ['brand_key' => $row['brand_key'], 'brand' => $row['brand'], 'types' => []];
-        $out[$row['brand_key']]['types'][] = ['type_key' => $row['type_key'], 'type' => $row['type']];
+        $out[$row['brand_key']]['types'][] = ['type_key' => $row['type_key'], 'type' => $row['type'], 'parts' => (int) $row['parts']];
     }
     return array_values($out);
 }
