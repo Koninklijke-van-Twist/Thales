@@ -1344,11 +1344,17 @@ function thales_suggest_tasks(string $query, int $limit = 20): array
         if ($score < 0.5) {
             continue;
         }
-        $prev = $best[$code]['score'] ?? 0.0;
-        if ($score >= $prev) {
-            $label = $desc !== '' ? $code . ' — ' . $desc : $code;
-            $best[$code] = ['value' => $code, 'label' => $label, 'score' => $score, 'times' => (int) $row['times']];
+        $prev = $best[$code]['score'] ?? -1.0;
+        if ($score < $prev) {
+            continue;
         }
+        // Bij gelijke score: lege omschrijving (bijv. uit workorders) mag een betere label niet overschrijven.
+        if ($score === $prev && isset($best[$code]) && $desc === '') {
+            $best[$code]['times'] = max((int) $best[$code]['times'], (int) $row['times']);
+            continue;
+        }
+        $label = $desc !== '' ? $code . ' — ' . $desc : $code;
+        $best[$code] = ['value' => $code, 'label' => $label, 'score' => $score, 'times' => max((int) ($best[$code]['times'] ?? 0), (int) $row['times'])];
     }
     $out = array_values($best);
     usort($out, static fn($a, $b): int => [$b['score'], $b['times']] <=> [$a['score'], $a['times']]);
@@ -1573,10 +1579,11 @@ function thales_fuzzy_score(string $query, string $text): float
 }
 
 /**
- * Fuzzy zoeken op artikelnr, BC-naam en Excel-naam(en). Eerst gebruikt op merk+type, dan overige uit de itemcache.
- * @return array{used:list<array>,other:list<array>}
+ * Fuzzy zoeken op artikelnr, BC-naam en Excel-naam(en).
+ * Volgorde: (optioneel) taak+motor met kans → overige motor → rest artikelcache.
+ * @return array{task:list<array>,used:list<array>,other:list<array>}
  */
-function thales_search(string $query, string $brandKey = '', string $typeKey = '', int $limit = 50): array
+function thales_search(string $query, string $brandKey = '', string $typeKey = '', int $limit = 50, string $taskCode = ''): array
 {
     $query = trim($query);
     $db = thales_db();
@@ -1625,67 +1632,96 @@ function thales_search(string $query, string $brandKey = '', string $typeKey = '
         }
         usort($other, static fn($a, $b): int => [$b['score'], $b['times_used']] <=> [$a['score'], $a['times_used']]);
     }
-    return ['used' => array_slice(array_values($used), 0, $limit), 'other' => array_slice($other, 0, $limit)];
+
+    $taskHits = [];
+    $code = strtoupper(trim($taskCode));
+    if ($code !== '' && $query !== '') {
+        $odds = thales_task_odds($code, $brandKey, $typeKey);
+        $seen = [];
+        foreach ($odds['parts'] as $p) {
+            $no = (string) $p['item_no'];
+            if (isset($seen[$no])) {
+                continue;
+            }
+            $hay = $no . ' ' . (string) $p['description'];
+            $stmtS = $db->prepare('SELECT COALESCE(search, "") FROM items WHERE item_no = ?');
+            $stmtS->execute([$no]);
+            $searchTxt = trim((string) ($stmtS->fetchColumn() ?: ''));
+            if ($searchTxt !== '') {
+                $hay = $searchTxt;
+            }
+            $score = thales_fuzzy_score($query, $hay);
+            if ($score < 0.5) {
+                continue;
+            }
+            $row = $used[$no] ?? null;
+            if ($row === null) {
+                foreach ($other as $i => $o) {
+                    if ((string) $o['item_no'] === $no) {
+                        $row = $o;
+                        unset($other[$i]);
+                        break;
+                    }
+                }
+            } else {
+                unset($used[$no]);
+            }
+            if ($row === null) {
+                $row = [
+                    'item_no' => $no,
+                    'description' => (string) $p['description'],
+                    'times_used' => (int) $p['times'],
+                    'score' => $score,
+                ];
+            } else {
+                $row['score'] = max((float) ($row['score'] ?? 0), $score);
+            }
+            $row['odds'] = (float) $p['odds'];
+            $taskHits[] = $row;
+            $seen[$no] = true;
+        }
+        usort($taskHits, static fn($a, $b): int => [($b['odds'] ?? 0), $b['score'], $b['times_used'] ?? 0] <=> [($a['odds'] ?? 0), $a['score'], $a['times_used'] ?? 0]);
+        $other = array_values($other);
+    }
+
+    return [
+        'task' => array_slice($taskHits, 0, $limit),
+        'used' => array_slice(array_values($used), 0, $limit),
+        'other' => array_slice($other, 0, $limit),
+    ];
 }
 
 /**
- * Autocomplete voor onderdelen: artikelnr / BC-naam / Excel-naam. Met motor: alleen usage van dat merk+type.
- * @return list<array{value:string,label:string}>
+ * Autocomplete voor onderdelen: fuzzy op artikelnr / BC-naam / Excel-naam.
+ * Met taakcode: eerst taak+motor, dan overige motor, dan rest. Zonder taak: motor → rest.
+ * @return list<array{value:string,label:string,score?:float}>
  */
-function thales_suggest_parts(string $prefix, string $brandKey = '', string $typeKey = '', int $limit = 20): array
+function thales_suggest_parts(string $prefix, string $brandKey = '', string $typeKey = '', int $limit = 20, string $taskCode = ''): array
 {
     $q = trim($prefix);
     if (mb_strlen($q) < 2) {
         return [];
     }
-    $esc = str_replace(['\\', '%', '_'], ['\\\\', '\\%', '\\_'], strtolower($q));
-    $like = '%' . $esc . '%';
-    $db = thales_db();
-    $vis = thales_sql_item_visible('i', 'i.item_no');
-    if ($brandKey !== '') {
-        $sql = "SELECT i.item_no,
-            COALESCE(NULLIF(TRIM(i.description), ''), NULLIF(TRIM(i.excel_name), ''), i.item_no) name
-            FROM usage u JOIN items i ON i.item_no = u.item_no
-            WHERE u.brand_key = ? AND u.type_key = ? AND $vis
-              AND (LOWER(i.item_no) LIKE ? ESCAPE '\\' OR i.search LIKE ? ESCAPE '\\'
-                   OR LOWER(COALESCE(i.description, '')) LIKE ? ESCAPE '\\'
-                   OR LOWER(COALESCE(i.excel_name, '')) LIKE ? ESCAPE '\\'
-                   OR EXISTS (SELECT 1 FROM item_excel_names x WHERE x.item_no = i.item_no AND LOWER(x.name) LIKE ? ESCAPE '\\'))
-            GROUP BY i.item_no ORDER BY MAX(u.times_used) DESC, i.item_no LIMIT " . max(1, (int) $limit);
-        $stmt = $db->prepare($sql);
-        $stmt->execute([$brandKey, $typeKey, $like, $like, $like, $like, $like]);
-    } else {
-        $sql = "SELECT i.item_no,
-            COALESCE(NULLIF(TRIM(i.description), ''), NULLIF(TRIM(i.excel_name), ''), i.item_no) name
-            FROM items i
-            WHERE $vis AND (LOWER(i.item_no) LIKE ? ESCAPE '\\' OR i.search LIKE ? ESCAPE '\\'
-               OR LOWER(COALESCE(i.description, '')) LIKE ? ESCAPE '\\'
-               OR LOWER(COALESCE(i.excel_name, '')) LIKE ? ESCAPE '\\'
-               OR EXISTS (SELECT 1 FROM item_excel_names x WHERE x.item_no = i.item_no AND LOWER(x.name) LIKE ? ESCAPE '\\'))
-            ORDER BY i.item_no LIMIT " . max(1, (int) $limit);
-        $stmt = $db->prepare($sql);
-        $stmt->execute([$like, $like, $like, $like, $like]);
-    }
+    $limit = max(1, (int) $limit);
+    $search = thales_search($q, $brandKey, $typeKey, $limit, $taskCode);
     $out = [];
-    $ql = strtolower($q);
-    foreach ($stmt->fetchAll() as $row) {
-        $matched = (string) $row['name'];
-        if (str_contains(strtolower((string) $row['item_no']), $ql)) {
-            $matched = (string) $row['name'];
-        } else {
-            $stmtN = $db->prepare('SELECT name FROM item_excel_names WHERE item_no = ? ORDER BY times DESC, name');
-            $stmtN->execute([$row['item_no']]);
-            foreach ($stmtN->fetchAll(PDO::FETCH_COLUMN) as $excelName) {
-                if (str_contains(strtolower((string) $excelName), $ql)) {
-                    $matched = (string) $excelName;
-                    break;
-                }
-            }
-            if (!str_contains(strtolower($matched), $ql) && str_contains(strtolower((string) $row['name']), $ql)) {
-                $matched = (string) $row['name'];
-            }
+    foreach (array_merge($search['task'], $search['used'], $search['other']) as $row) {
+        $name = trim((string) ($row['description'] ?? ''));
+        if ($name === '') {
+            $name = (string) $row['item_no'];
         }
-        $out[] = ['value' => (string) $row['item_no'], 'label' => $matched . ' · ' . $row['item_no']];
+        $label = $name . ' · ' . $row['item_no'];
+        if (isset($row['odds'])) {
+            $label .= ' (' . (int) round(((float) $row['odds']) * 100) . '%)';
+        }
+        $out[] = [
+            'value' => (string) $row['item_no'],
+            'label' => $label,
+            'score' => (float) ($row['score'] ?? 0),
+        ];
+        if (count($out) >= $limit) {
+            break;
+        }
     }
     return $out;
 }

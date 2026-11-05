@@ -56,7 +56,7 @@ function thales_render_parts_modal(string $brandKey, string $typeKey, string $it
 
 
 /**
- * Autocomplete (JSON, zelfde auth): ?suggest=<prefix> | ?suggest_parts=<prefix>&brand=&type=
+ * Autocomplete (JSON, zelfde auth): ?suggest= | ?suggest_parts=&brand=&type= | ?suggest_tasks=
  * Modal-fragment (HTML, zelfde auth): ?tab=library&brand=&type=&item=&partial=1
  */
 if (isset($_GET['suggest'])) {
@@ -69,7 +69,9 @@ if (isset($_GET['suggest_parts'])) {
     echo json_encode(thales_suggest_parts(
         (string) $_GET['suggest_parts'],
         (string) ($_GET['brand'] ?? ''),
-        (string) ($_GET['type'] ?? '')
+        (string) ($_GET['type'] ?? ''),
+        20,
+        (string) ($_GET['task'] ?? '')
     ));
     exit;
 }
@@ -120,10 +122,13 @@ $motorText = static fn(array $m): string => LOC('test.brand') . ': ' . (trim((st
 $motorBrand = (string) ($lookup['motor']['brand_key'] ?? '');
 $motorType = (string) ($lookup['motor']['type_key'] ?? '');
 $taskOdds = $tab === 'test' && $taskCode !== '' ? thales_task_odds($taskCode, $motorBrand, $motorType) : null;
-$results = $tab === 'test' && ($query !== '' || ($lookup && $taskCode === '')) ? thales_search($query, $motorBrand, $motorType) : null;
+$results = null;
+if ($tab === 'test' && ($query !== '' || ($lookup && $taskCode === ''))) {
+    $results = thales_search($query, $motorBrand, $motorType, 50, $taskCode);
+}
 // Met taakcode: zoekbalk blijft beschikbaar naast de kanskaarten (zonder taak ≈ oude gedrag).
 if ($tab === 'test' && $taskCode !== '' && $query !== '') {
-    $results = thales_search($query, $motorBrand, $motorType);
+    $results = thales_search($query, $motorBrand, $motorType, 50, $taskCode);
 }
 
 /** Fragment: alleen de parts-modal (zelfde auth), voor openen zonder herladen. */
@@ -203,6 +208,14 @@ if (isset($_GET['partial']) && (string) $_GET['partial'] === '1') {
         .odds-card .odds-add { position: absolute; top: 10px; right: 8px; background: var(--kvt-main-blue); color: #fff; border: 0; border-radius: 50%; width: 28px; height: 28px; line-height: 28px; padding: 0; font-size: 1.1rem; }
         .odds-pct { font-size: 1.25rem; font-weight: 700; color: var(--kvt-perkins-blue); }
         form.test-form label { display: inline-block; margin-right: 12px; margin-bottom: 8px; vertical-align: top; }
+        .ac-wrap { position: relative; display: inline-block; }
+        .ac-menu { position: absolute; left: 0; right: 0; top: 100%; z-index: 40; margin: 2px 0 0; padding: 4px 0; list-style: none;
+            max-height: 240px; overflow: auto; background: #fff; border: 1px solid var(--kvt-line); border-radius: 6px;
+            box-shadow: 0 4px 14px rgba(0,0,0,.12); min-width: 220px; }
+        .ac-menu[hidden] { display: none; }
+        .ac-menu li { padding: 6px 10px; cursor: pointer; font-size: 0.92rem; line-height: 1.25; }
+        .ac-menu li[aria-selected="true"], .ac-menu li:hover { background: var(--kvt-row-ok); }
+        .ac-menu .ac-sub { display: block; color: var(--kvt-muted, #666); font-size: 0.82rem; }
     </style>
 </head>
 <body>
@@ -344,10 +357,12 @@ if (isset($_GET['partial']) && (string) $_GET['partial'] === '1') {
     <section>
         <form method="get" class="test-form">
             <input type="hidden" name="tab" value="test">
-            <label><?= h(LOC('test.component')) ?><br><input type="text" name="component" value="<?= h($component) ?>" list="component-suggest" autocomplete="off"></label>
-            <datalist id="component-suggest"></datalist>
-            <label><?= h(LOC('test.task')) ?><br><input type="text" name="task" id="task-input" value="<?= h($taskCode) ?>" list="task-suggest" autocomplete="off" placeholder="<?= h(LOC('test.task_hint')) ?>"></label>
-            <datalist id="task-suggest"></datalist>
+            <label><?= h(LOC('test.component')) ?><br>
+                <span class="ac-wrap"><input type="text" name="component" id="component-input" value="<?= h($component) ?>" autocomplete="off" aria-autocomplete="list" aria-controls="component-ac" aria-expanded="false">
+                <ul class="ac-menu" id="component-ac" role="listbox" hidden></ul></span></label>
+            <label><?= h(LOC('test.task')) ?><br>
+                <span class="ac-wrap"><input type="text" name="task" id="task-input" value="<?= h($taskCode) ?>" autocomplete="off" placeholder="<?= h(LOC('test.task_hint')) ?>" aria-autocomplete="list" aria-controls="task-ac" aria-expanded="false">
+                <ul class="ac-menu" id="task-ac" role="listbox" hidden></ul></span></label>
             <button type="submit"><?= h(LOC('test.lookup')) ?></button>
             <?php if ($component !== '' && $lookup === null && $woHits === []): ?><p class="muted"><?= h(LOC('test.unknown')) ?></p><?php endif; ?>
             <?php foreach ($woHits as $hit): $wo = $hit['wo_no'] . ($hit['company'] !== '' ? ' (' . $hit['company'] . ')' : ''); ?>
@@ -362,8 +377,9 @@ if (isset($_GET['partial']) && (string) $_GET['partial'] === '1') {
                 <p><?= $lookup['role'] === 'SET' ? h(LOC('test.motor', $m['component_no'])) . '<br>' : '' ?><?= h($motorText($m)) ?>
                     <span class="muted">(<?= h(LOC('lib.source', $m['brand_source'])) ?>)</span></p>
             <?php endif; ?>
-            <label><?= h(LOC('test.search')) ?><br><input type="text" name="q" value="<?= h($query) ?>" list="part-suggest" autocomplete="off"<?= $taskCode === '' ? ' autofocus' : '' ?>></label>
-            <datalist id="part-suggest"></datalist>
+            <label><?= h(LOC('test.search')) ?><br>
+                <span class="ac-wrap"><input type="text" name="q" id="part-input" value="<?= h($query) ?>" autocomplete="off"<?= $taskCode === '' ? ' autofocus' : '' ?> aria-autocomplete="list" aria-controls="part-ac" aria-expanded="false">
+                <ul class="ac-menu" id="part-ac" role="listbox" hidden></ul></span></label>
             <button type="submit"><?= h(LOC('button.search')) ?></button>
         </form>
     </section>
@@ -406,14 +422,20 @@ if (isset($_GET['partial']) && (string) $_GET['partial'] === '1') {
     </section>
     <?php endif; ?>
 
-    <?php if ($results !== null): foreach (['used' => 'test.used', 'other' => 'test.other'] as $key => $title): if ($key === 'used' && !$lookup) { continue; } ?>
+    <?php if ($results !== null):
+        $hasTaskHits = ($results['task'] ?? []) !== [];
+        foreach (['task' => 'test.task_hits', 'used' => ($hasTaskHits ? 'test.used_rest' : 'test.used'), 'other' => 'test.other'] as $key => $title):
+        if ($key === 'task' && !$hasTaskHits) { continue; }
+        if ($key === 'used' && !$lookup) { continue; }
+        $rows = $results[$key] ?? [];
+    ?>
     <section>
         <h2><?= h(LOC($title)) ?></h2>
-        <?php if ($results[$key] === []): ?><p class="muted"><?= h(LOC('test.none')) ?></p><?php else: ?>
+        <?php if ($rows === []): ?><p class="muted"><?= h(LOC('test.none')) ?></p><?php else: ?>
         <table>
-            <tr><th><?= h(LOC('col.item_no')) ?></th><th><?= h(LOC('col.description')) ?></th><th class="num"><?= h(LOC('col.times')) ?></th><th class="num"><?= h(LOC('col.score')) ?></th></tr>
-            <?php foreach ($results[$key] as $r): ?>
-                <tr><td><?= h($r['item_no']) ?></td><td><?= h($r['description']) ?></td><td class="num"><?= (int) $r['times_used'] ?></td><td class="num"><?= (int) round($r['score'] * 100) ?>%</td></tr>
+            <tr><th><?= h(LOC('col.item_no')) ?></th><th><?= h(LOC('col.description')) ?></th><?php if ($key === 'task'): ?><th class="num"><?= h(LOC('col.odds')) ?></th><?php endif; ?><th class="num"><?= h(LOC('col.times')) ?></th><th class="num"><?= h(LOC('col.score')) ?></th></tr>
+            <?php foreach ($rows as $r): ?>
+                <tr><td><?= h($r['item_no']) ?></td><td><?= h($r['description']) ?></td><?php if ($key === 'task'): ?><td class="num"><?= (int) round(((float) ($r['odds'] ?? 0)) * 100) ?>%</td><?php endif; ?><td class="num"><?= (int) ($r['times_used'] ?? $r['times'] ?? 0) ?></td><td class="num"><?= (int) round($r['score'] * 100) ?>%</td></tr>
             <?php endforeach; ?>
         </table>
         <?php endif; ?>
@@ -434,68 +456,111 @@ if (isset($_GET['partial']) && (string) $_GET['partial'] === '1') {
     <div id="test-modal-mount"></div>
     <script>
     (function () {
-        var input = document.querySelector('input[name=component]'), list = document.getElementById('component-suggest'), timer = null, last = '';
-        if (input && list && window.fetch) {
+        function bindSuggest(input, menu, opts) {
+            if (!input || !menu || !window.fetch) { return; }
+            var timer = null, last = '', items = [], active = -1, blurTimer = null;
+            var minLen = opts.minLen || 1, debounce = opts.debounce || 150;
+            function close() {
+                menu.hidden = true; menu.innerHTML = ''; items = []; active = -1;
+                input.setAttribute('aria-expanded', 'false');
+            }
+            function render() {
+                menu.innerHTML = '';
+                items.forEach(function (row, i) {
+                    var li = document.createElement('li');
+                    li.setAttribute('role', 'option');
+                    li.setAttribute('aria-selected', i === active ? 'true' : 'false');
+                    li.textContent = row.label || row.value;
+                    if (row.sub) {
+                        var sub = document.createElement('span');
+                        sub.className = 'ac-sub';
+                        sub.textContent = row.sub;
+                        li.appendChild(sub);
+                    }
+                    li.addEventListener('mousedown', function (e) {
+                        e.preventDefault();
+                        pick(i);
+                    });
+                    menu.appendChild(li);
+                });
+                menu.hidden = items.length === 0;
+                input.setAttribute('aria-expanded', items.length ? 'true' : 'false');
+            }
+            function setActive(i) {
+                if (!items.length) { active = -1; return; }
+                active = (i + items.length) % items.length;
+                Array.prototype.forEach.call(menu.children, function (li, j) {
+                    li.setAttribute('aria-selected', j === active ? 'true' : 'false');
+                    if (j === active) { li.scrollIntoView({ block: 'nearest' }); }
+                });
+            }
+            function pick(i) {
+                if (i < 0 || i >= items.length) { return; }
+                var row = items[i];
+                input.value = row.value;
+                close();
+                if (typeof opts.onPick === 'function') { opts.onPick(row); }
+                else if (input.form) { input.form.requestSubmit ? input.form.requestSubmit() : input.form.submit(); }
+            }
+            function load(q) {
+                var url = opts.url(q);
+                fetch(url, { credentials: 'same-origin' }).then(function (r) {
+                    if (!r.ok) { throw new Error('suggest ' + r.status); }
+                    return r.json();
+                }).then(function (rows) {
+                    if (input.value.trim() !== q) { return; }
+                    items = (rows || []).map(opts.mapRow || function (row) {
+                        return { value: row.value, label: row.label || row.value, sub: row.kind || '' };
+                    });
+                    active = items.length ? 0 : -1;
+                    render();
+                }).catch(function () { close(); });
+            }
             input.addEventListener('input', function () {
                 clearTimeout(timer);
                 timer = setTimeout(function () {
                     var q = input.value.trim();
                     if (q === last) { return; }
                     last = q;
-                    if (q.length < 2) { list.innerHTML = ''; return; }
-                    fetch('?suggest=' + encodeURIComponent(q), { credentials: 'same-origin' }).then(function (r) { return r.json(); }).then(function (rows) {
-                        list.innerHTML = '';
-                        rows.forEach(function (row) { var o = document.createElement('option'); o.value = row.value; o.label = row.kind; list.appendChild(o); });
-                    }).catch(function () {});
-                }, 200);
+                    if (q.length < minLen) { close(); return; }
+                    load(q);
+                }, debounce);
             });
-        }
-        var taskInput = document.getElementById('task-input'), taskList = document.getElementById('task-suggest'), taskTimer = null, taskLast = '';
-        if (taskInput && taskList && window.fetch) {
-            taskInput.addEventListener('input', function () {
-                clearTimeout(taskTimer);
-                taskTimer = setTimeout(function () {
-                    var q = taskInput.value.trim();
-                    if (q === taskLast) { return; }
-                    taskLast = q;
-                    if (q.length < 1) { taskList.innerHTML = ''; return; }
-                    fetch('?suggest_tasks=' + encodeURIComponent(q), { credentials: 'same-origin' }).then(function (r) { return r.json(); }).then(function (rows) {
-                        taskList.innerHTML = '';
-                        rows.forEach(function (row) {
-                            var o = document.createElement('option');
-                            o.value = row.value;
-                            o.label = row.label;
-                            taskList.appendChild(o);
-                        });
-                    }).catch(function () {});
-                }, 200);
+            input.addEventListener('keydown', function (e) {
+                if (menu.hidden) { return; }
+                if (e.key === 'ArrowDown') { e.preventDefault(); setActive(active + 1); }
+                else if (e.key === 'ArrowUp') { e.preventDefault(); setActive(active - 1); }
+                else if (e.key === 'Enter' && active >= 0) { e.preventDefault(); pick(active); }
+                else if (e.key === 'Escape') { e.preventDefault(); close(); }
             });
+            input.addEventListener('blur', function () {
+                blurTimer = setTimeout(close, 150);
+            });
+            input.addEventListener('focus', function () { clearTimeout(blurTimer); });
         }
-        var partInput = document.querySelector('input[name=q]'), partList = document.getElementById('part-suggest'), partTimer = null, partLast = '';
         var brandKey = <?= json_encode($motorBrand, JSON_UNESCAPED_UNICODE) ?>;
         var typeKey = <?= json_encode($motorType, JSON_UNESCAPED_UNICODE) ?>;
-        if (partInput && partList && window.fetch) {
-            partInput.addEventListener('input', function () {
-                clearTimeout(partTimer);
-                partTimer = setTimeout(function () {
-                    var q = partInput.value.trim();
-                    if (q === partLast) { return; }
-                    partLast = q;
-                    if (q.length < 2) { partList.innerHTML = ''; return; }
-                    var url = '?suggest_parts=' + encodeURIComponent(q);
-                    if (brandKey) { url += '&brand=' + encodeURIComponent(brandKey) + '&type=' + encodeURIComponent(typeKey); }
-                    fetch(url, { credentials: 'same-origin' }).then(function (r) { return r.json(); }).then(function (rows) {
-                        partList.innerHTML = '';
-                        rows.forEach(function (row) {
-                            var o = document.createElement('option');
-                            o.value = row.value;
-                            o.label = row.label;
-                            partList.appendChild(o);
-                        });
-                    }).catch(function () {});
-                }, 200);
-            });
-        }
+        var taskCodeJs = <?= json_encode($taskCode, JSON_UNESCAPED_UNICODE) ?>;
+        bindSuggest(document.getElementById('component-input'), document.getElementById('component-ac'), {
+            minLen: 2,
+            url: function (q) { return '?suggest=' + encodeURIComponent(q); },
+            mapRow: function (row) { return { value: row.value, label: row.value, sub: row.kind || '' }; }
+        });
+        bindSuggest(document.getElementById('task-input'), document.getElementById('task-ac'), {
+            minLen: 1,
+            url: function (q) { return '?suggest_tasks=' + encodeURIComponent(q); },
+            mapRow: function (row) { return { value: row.value, label: row.label || row.value, sub: '' }; }
+        });
+        bindSuggest(document.getElementById('part-input'), document.getElementById('part-ac'), {
+            minLen: 2,
+            url: function (q) {
+                var url = '?suggest_parts=' + encodeURIComponent(q);
+                if (brandKey) { url += '&brand=' + encodeURIComponent(brandKey) + '&type=' + encodeURIComponent(typeKey); }
+                if (taskCodeJs) { url += '&task=' + encodeURIComponent(taskCodeJs); }
+                return url;
+            },
+            mapRow: function (row) { return { value: row.value, label: row.label || row.value, sub: '' }; }
+        });
 
         /* ---- Nodig (localStorage + DnD; kolom = dropzone; zelfde part-bar-kleur) ---- */
         var LS = 'thales-nodig-v1';
