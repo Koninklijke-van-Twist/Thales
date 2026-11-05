@@ -23,6 +23,15 @@ function thales_fmt_qty(mixed $value): string
 }
 
 /**
+ * Autocomplete (JSON, zelfde auth): ?suggest=<prefix>
+ */
+if (isset($_GET['suggest'])) {
+    header('Content-Type: application/json; charset=utf-8');
+    echo json_encode(thales_suggest((string) $_GET['suggest']));
+    exit;
+}
+
+/**
  * Page load (alleen eigen cache, nooit live BC/SharePoint)
  */
 $tab = ($_GET['tab'] ?? 'library') === 'test' ? 'test' : 'library';
@@ -41,6 +50,14 @@ $itemNo = (string) ($_GET['item'] ?? '');
 $component = trim((string) ($_GET['component'] ?? ''));
 $query = trim((string) ($_GET['q'] ?? ''));
 $lookup = $tab === 'test' && $component !== '' ? thales_component_lookup($component) : null;
+$woHits = $tab === 'test' && $component !== '' && $lookup === null ? thales_workorder_components($component) : [];
+foreach ($woHits as $i => $hit) { // werkorder ingevuld: component(en) erbij opzoeken, alle bedrijven
+    $woHits[$i]['lookup'] = $hit['component_no'] !== '' ? thales_component_lookup($hit['component_no']) : null;
+    $lookup ??= $woHits[$i]['lookup']; // onderdelen van de eerste gevonden
+}
+$unknown = LOC('test.unknown_value');
+$motorText = static fn(array $m): string => LOC('test.brand') . ': ' . (trim((string) $m['brand']) !== '' && $m['brand_key'] !== '?' ? $m['brand'] : $unknown)
+    . ' · ' . LOC('test.type') . ': ' . (trim((string) $m['type']) !== '' ? $m['type'] : $unknown);
 $results = $tab === 'test' && ($query !== '' || $lookup) ? thales_search($query, (string) ($lookup['motor']['brand_key'] ?? ''), (string) ($lookup['motor']['type_key'] ?? '')) : null;
 ?><!DOCTYPE html>
 <html lang="<?= h(getHtmlLang()) ?>">
@@ -165,13 +182,19 @@ $results = $tab === 'test' && ($query !== '' || $lookup) ? thales_search($query,
     <section>
         <form method="get">
             <input type="hidden" name="tab" value="test">
-            <label><?= h(LOC('test.component')) ?><br><input type="text" name="component" value="<?= h($component) ?>"></label>
+            <label><?= h(LOC('test.component')) ?><br><input type="text" name="component" value="<?= h($component) ?>" list="component-suggest" autocomplete="off"></label>
+            <datalist id="component-suggest"></datalist>
             <button type="submit"><?= h(LOC('test.lookup')) ?></button>
-            <?php if ($component !== '' && $lookup === null): ?><p class="muted"><?= h(LOC('test.unknown')) ?></p><?php endif; ?>
-            <?php if ($lookup): $m = $lookup['motor']; ?>
-                <p><?= $lookup['role'] === 'SET' ? h(LOC('test.motor', $m['component_no'])) . '<br>' : '' ?>
-                    <strong><?= h(LOC('test.brand')) ?>:</strong> <?= h($m['brand']) ?> ·
-                    <strong><?= h(LOC('test.type')) ?>:</strong> <?= h($m['type'] !== '' ? $m['type'] : '–') ?>
+            <?php if ($component !== '' && $lookup === null && $woHits === []): ?><p class="muted"><?= h(LOC('test.unknown')) ?></p><?php endif; ?>
+            <?php foreach ($woHits as $hit): $wo = $hit['wo_no'] . ($hit['company'] !== '' ? ' (' . $hit['company'] . ')' : ''); ?>
+                <p><?php if ($hit['component_no'] === ''): ?><?= h(LOC('test.wo_no_component', $wo)) ?>
+                <?php elseif ($hit['lookup'] === null): ?><?= h(LOC('test.wo', $wo, $hit['component_no'])) ?><br><span class="muted"><?= h(LOC('test.unknown')) ?></span>
+                <?php else: $m = $hit['lookup']['motor']; ?><?= h(LOC('test.wo', $wo, $hit['component_no'])) ?><br>
+                    <?= $hit['lookup']['role'] === 'SET' ? h(LOC('test.motor', $m['component_no'])) . '<br>' : '' ?><?= h($motorText($m)) ?>
+                    <span class="muted">(<?= h(LOC('lib.source', $m['brand_source'])) ?>)</span><?php endif; ?></p>
+            <?php endforeach; ?>
+            <?php if ($lookup && $woHits === []): $m = $lookup['motor']; ?>
+                <p><?= $lookup['role'] === 'SET' ? h(LOC('test.motor', $m['component_no'])) . '<br>' : '' ?><?= h($motorText($m)) ?>
                     <span class="muted">(<?= h(LOC('lib.source', $m['brand_source'])) ?>)</span></p>
             <?php endif; ?>
             <label><?= h(LOC('test.search')) ?><br><input type="text" name="q" value="<?= h($query) ?>" autofocus></label>
@@ -191,6 +214,25 @@ $results = $tab === 'test' && ($query !== '' || $lookup) ? thales_search($query,
         <?php endif; ?>
     </section>
     <?php endforeach; endif; ?>
+    <script>
+    (function () {
+        var input = document.querySelector('input[name=component]'), list = document.getElementById('component-suggest'), timer = null, last = '';
+        if (!input || !list || !window.fetch) { return; }
+        input.addEventListener('input', function () {
+            clearTimeout(timer);
+            timer = setTimeout(function () {
+                var q = input.value.trim();
+                if (q === last) { return; }
+                last = q;
+                if (q.length < 2) { list.innerHTML = ''; return; }
+                fetch('?suggest=' + encodeURIComponent(q), { credentials: 'same-origin' }).then(function (r) { return r.json(); }).then(function (rows) {
+                    list.innerHTML = '';
+                    rows.forEach(function (row) { var o = document.createElement('option'); o.value = row.value; o.label = row.kind; list.appendChild(o); });
+                }).catch(function () {});
+            }, 200);
+        });
+    })();
+    </script>
 <?php endif; ?>
 </main>
 <?php renderLanguageSwitcherScript(); ?>

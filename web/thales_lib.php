@@ -32,6 +32,17 @@ const THALES_BC_ITEM_DEFAULT = [
     'description' => 'Description',
     'modified' => 'Last_Date_Modified', // alleen een datum: delta met 'ge'
 ];
+/** Werkorders (zelfde webservice als Daedalus; velden bevestigd door Ariadne 05-11-2026). Sleutel: bedrijf + No. */
+const THALES_BC_WORKORDER_DEFAULT = [
+    'entity' => 'AppWerkorders',
+    'companies' => ['Koninklijke van Twist', 'Hunter van Twist'], // exacte BC-namen (zoals Daedalus)
+    'key' => 'No',                 // werkordernummer, bijv. '4085191' of 'WO2600033' (uniek per bedrijf)
+    'component' => 'Component_No', // componentnummer; leeg is normaal (8–25%)
+    'created' => 'Created_On',     // altijd gevuld: backfill per maand + delta
+    'start' => 'Start_Date',       // tweede delta-query (kan 0001-01-01 zijn)
+    'min_date' => '2002-01-01',    // ondergrens backfill
+    'delta_days' => 31,
+];
 /** Mímir accepteert max. top 10000; top 0 loopt vast. Deel groter dan dit wordt verder opgesplitst. */
 const THALES_MIMIR_CHUNK = 5000;
 /** Tekens waarop een te groot deel verder wordt gesplitst; ook leestekens, want BC-nummers als 'KO-…' en 'PK-…' gaan na het voorvoegsel verder met '-'. */
@@ -141,6 +152,9 @@ CREATE TABLE IF NOT EXISTS components (component_no TEXT PRIMARY KEY, parent_no 
 CREATE INDEX IF NOT EXISTS comp_parent ON components(parent_no);
 CREATE TABLE IF NOT EXISTS report_motor (item_id TEXT PRIMARY KEY, component_no TEXT, brand_key TEXT, brand TEXT,
     type_key TEXT, type TEXT, brand_source TEXT);
+CREATE TABLE IF NOT EXISTS workorders (company TEXT NOT NULL, wo_no TEXT NOT NULL, component_no TEXT, created_on TEXT, start_date TEXT, synced_at TEXT,
+    PRIMARY KEY (company, wo_no));
+CREATE INDEX IF NOT EXISTS wo_no ON workorders(wo_no);
 CREATE TABLE IF NOT EXISTS items (item_no TEXT PRIMARY KEY, description TEXT, search TEXT, synced_at TEXT);
 CREATE TABLE IF NOT EXISTS usage (
     brand_key TEXT, brand TEXT, type_key TEXT, type TEXT, brand_source TEXT, item_no TEXT, times_used INTEGER, qty_total REAL,
@@ -544,17 +558,17 @@ function thales_store_result(string $itemId, array $result): void
 /* ---------------------------------------------------------------- BC-cache via Mímir (alleen nightly) */
 
 /** @return list<array<string, mixed>> */
-function thales_mimir_query(string $table, array $select, string $filter = '', int $top = THALES_MIMIR_CHUNK): array
+function thales_mimir_query(string $table, array $select, string $filter = '', int $top = THALES_MIMIR_CHUNK, ?string $company = null): array
 {
     if (is_callable($GLOBALS['THALES_MIMIR'] ?? null)) {
-        return ($GLOBALS['THALES_MIMIR'])($table, $select, $filter, $top);
+        return ($GLOBALS['THALES_MIMIR'])($table, $select, $filter, $top, $company);
     }
     $key = trim((string) thales_cfg('mimirApi', ''));
     if ($key === '') {
         throw new RuntimeException('$mimirApi ontbreekt in auth.php');
     }
     $base = rtrim((string) thales_cfg('mimirBase', 'https://sleutels.kvt.nl/mimir/api'), '/');
-    $body = ['company' => (string) thales_cfg('thalesCompany', 'Koninklijke van Twist'), 'table' => $table,
+    $body = ['company' => $company ?? (string) thales_cfg('thalesCompany', 'Koninklijke van Twist'), 'table' => $table,
         'max_age' => THALES_MIMIR_MAX_AGE, 'top' => $top, 'select' => array_values(array_filter($select))];
     if ($filter !== '') {
         $body['filter'] = $filter;
@@ -580,15 +594,15 @@ function thales_odata_quote(string $value): string
  *
  * @param callable(array<string,mixed>):void $onRow
  */
-function thales_mimir_each(string $table, array $select, string $key, string $baseFilter, callable $onRow, string $prefix = ''): int
+function thales_mimir_each(string $table, array $select, string $key, string $baseFilter, callable $onRow, string $prefix = '', ?string $company = null): int
 {
     $count = 0;
     foreach (str_split(THALES_MIMIR_SPLIT_CHARS) as $char) {
         $p = $prefix . $char;
         $filter = 'startswith(' . $key . ',' . thales_odata_quote($p) . ')' . ($baseFilter !== '' ? ' and (' . $baseFilter . ')' : '');
-        $rows = thales_mimir_query($table, $select, $filter, THALES_MIMIR_CHUNK);
+        $rows = thales_mimir_query($table, $select, $filter, THALES_MIMIR_CHUNK, $company);
         if (count($rows) >= THALES_MIMIR_CHUNK && strlen($p) < 8) {
-            $count += thales_mimir_each($table, $select, $key, $baseFilter, $onRow, $p);
+            $count += thales_mimir_each($table, $select, $key, $baseFilter, $onRow, $p, $company);
             continue;
         }
         foreach ($rows as $row) {
@@ -674,6 +688,147 @@ function thales_sync_items(): string
     thales_set_state('items_synced_on', $today);
     thales_set_state('items_full_v', '2');
     return $n . ' artikelen (' . ($filter === '' ? 'volledig' : 'delta') . ')';
+}
+
+function thales_bc_workorder_config(): array
+{
+    return array_merge(THALES_BC_WORKORDER_DEFAULT, (array) thales_cfg('thalesBcWorkorder', []));
+}
+
+/** Werkorders van één bedrijf met $filter in de cache zetten (in delen als het maximum geraakt wordt). */
+function thales_store_workorders(string $company, string $filter, string $today): int
+{
+    $cfg = thales_bc_workorder_config();
+    $select = [$cfg['key'], $cfg['component'], $cfg['created'], $cfg['start']];
+    $ins = thales_db()->prepare('INSERT OR REPLACE INTO workorders(company, wo_no, component_no, created_on, start_date, synced_at) VALUES(?, ?, ?, ?, ?, ?)');
+    $onRow = static function (array $row) use ($ins, $cfg, $today, $company): void {
+        $no = strtoupper(trim((string) ($row[$cfg['key']] ?? '')));
+        if ($no !== '') {
+            $ins->execute([$company, $no, strtoupper(trim((string) ($row[$cfg['component']] ?? ''))),
+                substr((string) ($row[$cfg['created']] ?? ''), 0, 10), substr((string) ($row[$cfg['start']] ?? ''), 0, 10), $today]);
+        }
+    };
+    $rows = thales_mimir_query((string) $cfg['entity'], $select, $filter, THALES_MIMIR_CHUNK, $company);
+    if (count($rows) < THALES_MIMIR_CHUNK) {
+        array_walk($rows, static fn(array $row) => $onRow($row));
+        return count($rows);
+    }
+    return thales_mimir_each((string) $cfg['entity'], $select, (string) $cfg['key'], $filter, $onRow, '', $company);
+}
+
+/**
+ * Oudste maand met werkorders (Created_On) van een bedrijf. Mímir kent geen $orderby, daarom binair zoeken
+ * met 'Created_On lt <maand>' en top 1 (ca. 9 kleine queries, één keer per bedrijf). Null = geen werkorders.
+ */
+function thales_workorder_oldest_month(string $company, DateTimeImmutable $now): ?string
+{
+    $cfg = thales_bc_workorder_config();
+    $has = static fn(DateTimeImmutable $before): bool => thales_mimir_query((string) $cfg['entity'], [$cfg['key']],
+        $cfg['created'] . ' lt ' . $before->format('Y-m-d'), 1, $company) !== [];
+    $base = new DateTimeImmutable(substr((string) $cfg['min_date'], 0, 7) . '-01', $now->getTimezone());
+    $lo = 0; // maand-index t.o.v. min_date
+    $hi = ((int) $now->format('Y') - (int) $base->format('Y')) * 12 + (int) $now->format('n') - (int) $base->format('n');
+    if (!$has($base->modify('+' . ($hi + 1) . ' months'))) {
+        return null;
+    }
+    while ($lo < $hi) { // kleinste m met werkorders vóór einde van maand m
+        $mid = intdiv($lo + $hi, 2);
+        $has($base->modify('+' . ($mid + 1) . ' months')) ? $hi = $mid : $lo = $mid + 1;
+    }
+    return $base->modify('+' . $lo . ' months')->format('Y-m');
+}
+
+/**
+ * Werkorders per bedrijf: elke nacht een delta (Created_On en Start_Date ge vandaag-31, twee queries) en één
+ * extra maand backfill op Created_On. State per bedrijf: workorders_backfill_oldest_month|<bedrijf> (oudste
+ * geladen maand), workorders_backfill_end|<bedrijf> (oudste maand in BC), workorders_backfill_done|<bedrijf>.
+ */
+function thales_sync_workorders(): string
+{
+    $cfg = thales_bc_workorder_config();
+    $tz = new DateTimeZone('Europe/Amsterdam');
+    $now = new DateTimeImmutable('now', $tz);
+    $today = $now->format('Y-m-d');
+    $since = $now->modify('-' . (int) $cfg['delta_days'] . ' days')->format('Y-m-d');
+    $db = thales_db();
+    $out = [];
+    foreach ((array) $cfg['companies'] as $company) {
+        $company = (string) $company;
+        $db->beginTransaction();
+        try {
+            $n = thales_store_workorders($company, $cfg['created'] . ' ge ' . $since, $today)
+                + thales_store_workorders($company, $cfg['start'] . ' ge ' . $since, $today);
+            $line = $company . ': ' . $n . ' delta';
+            if (thales_state('workorders_backfill_done|' . $company) !== '1') {
+                $end = thales_state('workorders_backfill_end|' . $company);
+                if ($end === null) {
+                    $end = thales_workorder_oldest_month($company, $now) ?? $now->format('Y-m');
+                    $end = max($end, substr((string) $cfg['min_date'], 0, 7));
+                    thales_set_state('workorders_backfill_end|' . $company, $end);
+                }
+                $oldest = thales_state('workorders_backfill_oldest_month|' . $company);
+                // eerste nacht: huidige maand; daarna telkens één maand terug
+                $month = $oldest === null ? new DateTimeImmutable($now->format('Y-m') . '-01', $tz)
+                    : (new DateTimeImmutable($oldest . '-01', $tz))->modify('-1 month');
+                $filter = $cfg['created'] . ' ge ' . $month->format('Y-m-d') . ' and ' . $cfg['created'] . ' lt ' . $month->modify('+1 month')->format('Y-m-d');
+                $b = thales_store_workorders($company, $filter, $today);
+                thales_set_state('workorders_backfill_oldest_month|' . $company, $month->format('Y-m'));
+                $done = $month->format('Y-m') <= $end;
+                if ($done) {
+                    thales_set_state('workorders_backfill_done|' . $company, '1');
+                }
+                $line .= ', backfill ' . $month->format('Y-m') . ': ' . $b . ($done ? ' (klaar)' : ' (tot ' . $end . ')');
+            }
+            $db->commit();
+        } catch (Throwable $e) {
+            $db->rollBack();
+            $line = $company . ': fout: ' . $e->getMessage();
+            thales_log('BC workorders ' . $line);
+        }
+        $out[] = $line;
+    }
+    return implode('; ', $out);
+}
+
+/**
+ * Werkorder => component(en), per bedrijf (hetzelfde nummer kan in meerdere bedrijven bestaan).
+ * Fallback: servicerapport (reports.wo). component_no '' = werkorder zonder component.
+ * @return list<array{company:string,wo_no:string,component_no:string}>
+ */
+function thales_workorder_components(string $woNo): array
+{
+    $no = strtoupper(trim($woNo));
+    $stmt = thales_db()->prepare('SELECT company, wo_no, component_no FROM workorders WHERE wo_no = ? ORDER BY company');
+    $stmt->execute([$no]);
+    $hits = $stmt->fetchAll();
+    if ($hits === []) {
+        $stmt = thales_db()->prepare("SELECT '' company, UPPER(wo) wo_no, UPPER(equipment_no) component_no FROM reports
+            WHERE UPPER(wo) = ? AND COALESCE(equipment_no, '') <> '' ORDER BY report_date DESC LIMIT 1");
+        $stmt->execute([$no]);
+        $hits = $stmt->fetchAll();
+    }
+    return array_map(static fn(array $h) => ['company' => (string) $h['company'], 'wo_no' => (string) $h['wo_no'], 'component_no' => (string) $h['component_no']], $hits);
+}
+
+/**
+ * Autocomplete: bekende componenten en werkorders uit de eigen cache, prefix-match.
+ * @return list<array{value:string,kind:string}>
+ */
+function thales_suggest(string $prefix, int $limit = 20): array
+{
+    $p = strtoupper(trim($prefix));
+    if ($p === '') {
+        return [];
+    }
+    $like = str_replace(['\\', '%', '_'], ['\\\\', '\\%', '\\_'], $p) . '%';
+    $stmt = thales_db()->prepare("SELECT value, GROUP_CONCAT(DISTINCT kind) kind FROM (
+        SELECT component_no value, 'component' kind FROM components WHERE component_no LIKE :p ESCAPE '\\'
+        UNION SELECT component_no, 'component' FROM report_components WHERE component_no LIKE :p ESCAPE '\\'
+        UNION SELECT wo_no, 'werkorder ' || company FROM workorders WHERE wo_no LIKE :p ESCAPE '\\'
+        UNION SELECT UPPER(wo), 'werkorder' FROM reports WHERE UPPER(wo) LIKE :p ESCAPE '\\'
+    ) GROUP BY value ORDER BY value LIMIT " . max(1, $limit));
+    $stmt->execute([':p' => $like]);
+    return $stmt->fetchAll();
 }
 
 /* ---------------------------------------------------------------- aggregaten */
@@ -775,18 +930,19 @@ function thales_nightly(?int $budgetSeconds = null): array
     $summary = ['status' => 'partial', 'ok' => 0, 'skipped' => 0, 'error' => 0];
     try {
         thales_progress('Start nightly');
-        $deltaDone = thales_sync_delta($deadline);
-        thales_progress('SharePoint-delta ' . ($deltaDone ? 'compleet' : 'nog niet compleet (gaat volgende run verder)'));
-        $pendingDone = thales_process_pending($deadline, $summary);
-        foreach (['components', 'items'] as $key) {
+        // BC-cache eerst: anders kan een lange rapport-backfill het hele budget opmaken en blijft de cache leeg.
+        foreach (['components', 'items', 'workorders'] as $key) {
             thales_progress('BC-cache bijwerken: ' . $key);
             try {
-                $summary[$key] = $key === 'items' ? thales_sync_items() : thales_sync_components();
+                $summary[$key] = match ($key) { 'items' => thales_sync_items(), 'workorders' => thales_sync_workorders(), default => thales_sync_components() };
             } catch (Throwable $e) {
                 $summary[$key] = 'fout: ' . $e->getMessage();
                 thales_log('BC ' . $key . ': ' . $e->getMessage());
             }
         }
+        $deltaDone = thales_sync_delta($deadline);
+        thales_progress('SharePoint-delta ' . ($deltaDone ? 'compleet' : 'nog niet compleet (gaat volgende run verder)'));
+        $pendingDone = thales_process_pending($deadline, $summary);
         thales_rebuild_aggregates();
         if ($deltaDone && $pendingDone) {
             thales_set_state('day_index', $today);
