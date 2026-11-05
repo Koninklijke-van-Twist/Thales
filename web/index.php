@@ -72,6 +72,17 @@ $results = $tab === 'test' && ($query !== '' || $lookup) ? thales_search($query,
         input[type=text] { padding: 6px; width: 280px; }
         button { background: var(--kvt-main-blue); color: #fff; border: 0; border-radius: 6px; padding: 7px 14px; cursor: pointer; }
         tr.active td { background: var(--kvt-row-ok); }
+        .part-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; }
+        .part-card { display: flex; flex-direction: column; gap: 4px; padding: 0 12px 10px; border: 1px solid var(--kvt-line); border-radius: 8px; overflow: hidden; text-decoration: none; color: inherit; background: var(--kvt-panel-bg); }
+        .part-card:hover, .part-card:focus { border-color: var(--kvt-main-blue); }
+        .part-card.active { background: var(--kvt-row-ok); border-color: var(--kvt-main-blue); }
+        .part-bar { display: block; height: 6px; margin: 0 -12px 6px; }
+        .part-name { color: var(--kvt-perkins-blue); word-break: break-word; }
+        .part-name.muted { font-weight: 400; font-style: italic; }
+        .part-no { font-variant-numeric: tabular-nums; }
+        .part-stats { font-size: .8rem; }
+        .part-sources { grid-column: 1 / -1; background: var(--kvt-row-ok); border-radius: 8px; padding: 10px 12px; }
+        @media (max-width: 600px) { .part-grid { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); } }
         .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.45); display: flex; align-items: flex-start; justify-content: center; padding: 4vh 12px; z-index: 1000; }
         .modal-overlay[hidden] { display: none; }
         .modal { position: relative; margin: 0; width: 100%; max-width: 900px; max-height: 92vh; overflow: auto; box-sizing: border-box; -webkit-overflow-scrolling: touch; }
@@ -112,21 +123,22 @@ $results = $tab === 'test' && ($query !== '' || $lookup) ? thales_search($query,
         <a class="modal-close" href="?tab=library" aria-label="<?= h(LOC('lib.close')) ?>" title="<?= h(LOC('lib.close')) ?>">&times;</a>
         <h2 id="parts-title"><?= h($brandKey) ?> · <?= h($typeKey !== '' ? $typeKey : LOC('lib.type_unknown')) ?></h2>
         <p class="muted"><?= h(LOC('lib.source', (string) ($parts[0]['brand_source'] ?? '–'))) ?> · <?= h(LOC('lib.pick')) ?></p>
-        <table>
-            <tr><th><?= h(LOC('col.item_no')) ?></th><th><?= h(LOC('col.description')) ?></th><th class="num"><?= h(LOC('col.times')) ?></th><th class="num"><?= h(LOC('col.qty')) ?></th></tr>
-            <?php foreach ($parts as $p): ?>
-                <tr class="<?= $p['item_no'] === $itemNo ? 'active' : '' ?>">
-                    <td><a href="?<?= h(http_build_query(['tab' => 'library', 'brand' => $brandKey, 'type' => $typeKey, 'item' => $p['item_no']])) ?>"><?= h($p['item_no']) ?></a></td>
-                    <td><?= h($p['description']) ?></td><td class="num"><?= (int) $p['times_used'] ?></td><td class="num"><?= h(thales_fmt_qty($p['qty_total'])) ?></td>
-                </tr>
-                <?php if ($p['item_no'] === $itemNo): ?>
-                <tr class="active"><td colspan="4"><strong><?= h(LOC('lib.sources')) ?>:</strong>
+        <div class="part-grid">
+            <?php foreach ($parts as $p): $isActive = $p['item_no'] === $itemNo; $hue = crc32($p['item_no']) % 360; ?>
+                <a class="part-card<?= $isActive ? ' active' : '' ?>" href="?<?= h(http_build_query(['tab' => 'library', 'brand' => $brandKey, 'type' => $typeKey, 'item' => $p['item_no']])) ?>">
+                    <span class="part-bar" style="background: hsl(<?= (int) $hue ?>, 55%, 45%);"></span>
+                    <strong class="part-name<?= $p['description'] === '' ? ' muted' : '' ?>"><?= h($p['description'] !== '' ? $p['description'] : LOC('lib.no_description')) ?></strong>
+                    <span class="part-no"><?= h($p['item_no']) ?></span>
+                    <span class="muted part-stats"><?= h(LOC('col.times')) ?>: <?= (int) $p['times_used'] ?> · <?= h(LOC('col.qty')) ?>: <?= h(thales_fmt_qty($p['qty_total'])) ?></span>
+                </a>
+                <?php if ($isActive): ?>
+                <div class="part-sources"><strong><?= h(LOC('lib.sources')) ?> · <?= h($p['item_no']) ?>:</strong>
                     <ul><?php foreach (thales_part_sources($brandKey, $typeKey, $itemNo) as $src): ?>
                         <li><a href="<?= h($src['web_url']) ?>" target="_blank" rel="noopener"><?= h($src['wo']) ?> · <?= h($src['report_date']) ?></a> <span class="muted"><?= h($src['name']) ?></span></li>
-                    <?php endforeach; ?></ul></td></tr>
+                    <?php endforeach; ?></ul></div>
                 <?php endif; ?>
             <?php endforeach; ?>
-        </table>
+        </div>
     </section>
     </div>
     <script>
@@ -143,7 +155,7 @@ $results = $tab === 'test' && ($query !== '' || $lookup) ? thales_search($query,
         overlay.querySelector('.modal-close').addEventListener('click', function (e) { e.preventDefault(); closeModal(); });
         overlay.addEventListener('click', function (e) { if (e.target === overlay) { closeModal(); } });
         document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && !overlay.hidden) { closeModal(); } });
-        var active = overlay.querySelector('tr.active');
+        var active = overlay.querySelector('.part-sources');
         if (active) { active.scrollIntoView({ block: 'nearest' }); }
     })();
     </script>
