@@ -72,6 +72,12 @@ $results = $tab === 'test' && ($query !== '' || $lookup) ? thales_search($query,
         input[type=text] { padding: 6px; width: 280px; }
         button { background: var(--kvt-main-blue); color: #fff; border: 0; border-radius: 6px; padding: 7px 14px; cursor: pointer; }
         tr.active td { background: var(--kvt-row-ok); }
+        .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.45); display: flex; align-items: flex-start; justify-content: center; padding: 4vh 12px; z-index: 1000; }
+        .modal-overlay[hidden] { display: none; }
+        .modal { position: relative; margin: 0; width: 100%; max-width: 900px; max-height: 92vh; overflow: auto; box-sizing: border-box; -webkit-overflow-scrolling: touch; }
+        .modal h2 { padding-right: 40px; }
+        .modal-close { background: var(--kvt-main-blue); color: #fff; border-radius: 6px; text-decoration: none; position: absolute; top: 10px; right: 10px; padding: 4px 11px; font-size: 1.2rem; line-height: 1; }
+        @media (max-width: 600px) { .modal-overlay { padding: 0; } .modal { max-height: 100vh; height: 100%; border-radius: 0; padding: 12px; } th, td { padding: 5px 6px; } }
     </style>
 </head>
 <body>
@@ -95,20 +101,22 @@ $results = $tab === 'test' && ($query !== '' || $lookup) ? thales_search($query,
             <h3><?= h($b['brand']) ?></h3>
             <p class="types">
             <?php foreach ($b['types'] as $t): $sel = $b['brand_key'] === $brandKey && $t['type_key'] === $typeKey; ?>
-                <a class="<?= $sel ? 'sel' : '' ?>" href="?<?= h(http_build_query(['tab' => 'library', 'brand' => $b['brand_key'], 'type' => $t['type_key']])) ?>#parts"><?= h($t['type'] !== '' ? $t['type'] : LOC('lib.type_unknown')) ?></a>
+                <a class="<?= $sel ? 'sel' : '' ?>" href="?<?= h(http_build_query(['tab' => 'library', 'brand' => $b['brand_key'], 'type' => $t['type_key']])) ?>"><?= h($t['type'] !== '' ? $t['type'] : LOC('lib.type_unknown')) ?></a>
             <?php endforeach; ?>
             </p>
         <?php endforeach; ?>
     </section>
     <?php if ($brandKey !== ''): $parts = thales_parts($brandKey, $typeKey); ?>
-    <section id="parts">
-        <h2><?= h($brandKey) ?> · <?= h($typeKey !== '' ? $typeKey : LOC('lib.type_unknown')) ?></h2>
+    <div class="modal-overlay" id="parts-modal">
+    <section id="parts" class="modal" role="dialog" aria-modal="true" aria-labelledby="parts-title">
+        <a class="modal-close" href="?tab=library" aria-label="<?= h(LOC('lib.close')) ?>" title="<?= h(LOC('lib.close')) ?>">&times;</a>
+        <h2 id="parts-title"><?= h($brandKey) ?> · <?= h($typeKey !== '' ? $typeKey : LOC('lib.type_unknown')) ?></h2>
         <p class="muted"><?= h(LOC('lib.source', (string) ($parts[0]['brand_source'] ?? '–'))) ?> · <?= h(LOC('lib.pick')) ?></p>
         <table>
             <tr><th><?= h(LOC('col.item_no')) ?></th><th><?= h(LOC('col.description')) ?></th><th class="num"><?= h(LOC('col.times')) ?></th><th class="num"><?= h(LOC('col.qty')) ?></th></tr>
             <?php foreach ($parts as $p): ?>
                 <tr class="<?= $p['item_no'] === $itemNo ? 'active' : '' ?>">
-                    <td><a href="?<?= h(http_build_query(['tab' => 'library', 'brand' => $brandKey, 'type' => $typeKey, 'item' => $p['item_no']])) ?>#parts"><?= h($p['item_no']) ?></a></td>
+                    <td><a href="?<?= h(http_build_query(['tab' => 'library', 'brand' => $brandKey, 'type' => $typeKey, 'item' => $p['item_no']])) ?>"><?= h($p['item_no']) ?></a></td>
                     <td><?= h($p['description']) ?></td><td class="num"><?= (int) $p['times_used'] ?></td><td class="num"><?= h(thales_fmt_qty($p['qty_total'])) ?></td>
                 </tr>
                 <?php if ($p['item_no'] === $itemNo): ?>
@@ -120,6 +128,25 @@ $results = $tab === 'test' && ($query !== '' || $lookup) ? thales_search($query,
             <?php endforeach; ?>
         </table>
     </section>
+    </div>
+    <script>
+    (function () {
+        var overlay = document.getElementById('parts-modal');
+        if (!overlay) { return; }
+        var closeUrl = '?tab=library';
+        document.body.style.overflow = 'hidden';
+        function closeModal() {
+            overlay.hidden = true;
+            document.body.style.overflow = '';
+            if (window.history && history.replaceState) { history.replaceState(null, '', closeUrl); }
+        }
+        overlay.querySelector('.modal-close').addEventListener('click', function (e) { e.preventDefault(); closeModal(); });
+        overlay.addEventListener('click', function (e) { if (e.target === overlay) { closeModal(); } });
+        document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && !overlay.hidden) { closeModal(); } });
+        var active = overlay.querySelector('tr.active');
+        if (active) { active.scrollIntoView({ block: 'nearest' }); }
+    })();
+    </script>
     <?php endif; ?>
 
 <?php else: ?>
