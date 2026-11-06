@@ -20,6 +20,41 @@ function check(bool $ok, string $message): void
     echo "ok  $message\n";
 }
 
+/** HTML van tab Taakcode testen tegen de testdatabase. Stub-auth alleen als web/auth.php ontbreekt; daarna weg. */
+function render_test_page(array $get): string
+{
+    $htmlFile = tempnam(sys_get_temp_dir(), 'thales-page-');
+    $auth = dirname(__DIR__) . '/auth.php';
+    $wroteAuth = false;
+    if (!is_file($auth)) {
+        file_put_contents($auth, "<?php\n\$allowedUsers = ['page-test@example.com'];\n");
+        $wroteAuth = true;
+    }
+    $script = '$_SERVER["REMOTE_ADDR"]="127.0.0.1";$_SERVER["SERVER_ADDR"]="127.0.0.1";'
+        . '$_SERVER["REQUEST_URI"]="/index.php";$_SERVER["REQUEST_METHOD"]="GET";'
+        . '$GLOBALS["THALES_DATA_DIR"]=' . var_export($GLOBALS['THALES_DATA_DIR'], true) . ';'
+        . '$_GET=' . var_export($get, true) . ';'
+        . 'ob_start(); require ' . var_export(dirname(__DIR__) . '/index.php', true) . ';'
+        . 'file_put_contents(' . var_export($htmlFile, true) . ', (string) ob_get_clean());';
+    $cmd = escapeshellarg(PHP_BINARY) . ' -d display_errors=1 -d error_reporting=E_ALL -r ' . escapeshellarg($script) . ' 2>&1';
+    try {
+        exec($cmd, $out, $code);
+        $html = is_file($htmlFile) ? (string) file_get_contents($htmlFile) : '';
+        if ($code !== 0 || $html === '') {
+            fwrite(STDERR, implode("\n", $out) . "\n");
+            check(false, 'pagina-render faalde');
+        }
+        return $html;
+    } finally {
+        if (is_file($htmlFile)) {
+            @unlink($htmlFile);
+        }
+        if ($wroteAuth && is_file($auth)) {
+            @unlink($auth);
+        }
+    }
+}
+
 /** Klein synthetisch rapport (inline strings, geen klantdata). */
 function make_fixture(string $path, array $sheets): void
 {
@@ -361,6 +396,27 @@ check(!in_array('TST-1', $usedNos, true), 'zoeken met taak: task-items niet dubb
 $sugTask = array_column(thales_suggest_parts('TST', 'PERKINS', '4016TAG2A', 20, 'CO'), 'value');
 check(($sugTask[0] ?? '') === 'TST-1' || ($sugTask[0] ?? '') === 'TST-2', 'suggest met taak: taak+motor eerst');
 check(in_array('TST-MOTOR', $sugTask, true), 'suggest met taak: ook motor-only onderdelen');
+
+// Pagina: taakcode mag motorhistorie en overige artikelen niet weghalen (leeg én met taakdata).
+$assertSections = static function (string $html, string $label, string $oddsText, bool $oddsGrid): void {
+    $usedAt = strpos($html, 'Eerder gebruikt bij deze motor');
+    $otherAt = strpos($html, 'Overige artikelen');
+    $histAt = strpos($html, 'data-item="TST-MOTOR"');
+    check($usedAt !== false && $otherAt !== false && $usedAt < $otherAt, $label . ': secties motorhistorie en overige artikelen blijven');
+    check($histAt !== false && $histAt > $usedAt && $histAt < $otherAt && str_contains($html, 'draggable="true"'), $label . ': motorhistorie-artikel blijft versleepbaar');
+    check(str_contains($html, $oddsText), $label . ': ' . $oddsText);
+    check(str_contains($html, 'id="odds-grid"') === $oddsGrid, $label . ': kanskaarten ' . ($oddsGrid ? 'aan' : 'uit'));
+};
+$motorLabel = 'PERKINS 4016TAG2A';
+$pageNone = render_test_page(['tab' => 'test', 'component' => '90000001', 'task' => 'XX']);
+$assertSections($pageNone, 'zonder taakdata', 'Nog geen XX-taken met onderdelen bekend voor ' . $motorLabel . '.', false);
+check(!str_contains($pageNone, 'class="odds-pct"'), 'zonder taakdata: geen kansen uit andere motoren');
+$pageCo = render_test_page(['tab' => 'test', 'component' => '90000001', 'task' => 'CO']);
+$assertSections($pageCo, 'met taakdata', 'Op basis van 4 CO-taken voor ' . $motorLabel . '.', true);
+check(str_contains($pageCo, 'data-item="TST-1"') && str_contains($pageCo, '>75%<'), 'met taakdata: kans alleen over CO-taken van dit motortype');
+$pageLow = render_test_page(['tab' => 'test', 'component' => '90000001', 'task' => 'SA']);
+$assertSections($pageLow, 'weinig taakdata', 'Lage zekerheid: maar 1 SA-taken met onderdelen bekend voor ' . $motorLabel . '.', true);
+check(str_contains($pageLow, 'data-item="TST-3"'), 'weinig taakdata: wel suggestie voor dit motortype');
 
 
 // ---------- WO-memo (KVT_Memo): gericht vullen, bewaren bij sync, suggest/fuzzy, preview

@@ -124,14 +124,11 @@ $motorType = (string) ($lookup['motor']['type_key'] ?? '');
 $taskOdds = $tab === 'test' && $taskCode !== '' && $motorBrand !== '' && $motorType !== ''
     ? thales_task_odds($taskCode, $motorBrand, $motorType)
     : null;
-$results = null;
-if ($tab === 'test' && ($query !== '' || ($lookup && $taskCode === ''))) {
-    $results = thales_search($query, $motorBrand, $motorType, 50, $taskCode);
-}
-// Met taakcode: zoekbalk blijft beschikbaar naast de kanskaarten (zonder taak ≈ oude gedrag).
-if ($tab === 'test' && $taskCode !== '' && $query !== '') {
-    $results = thales_search($query, $motorBrand, $motorType, 50, $taskCode);
-}
+// Taakcode beperkt alleen de kanskaarten. Motorhistorie en overige artikelen blijven,
+// ook als dit motortype nog geen taken voor die code heeft.
+$results = $tab === 'test' && ($query !== '' || $lookup)
+    ? thales_search($query, $motorBrand, $motorType, 50, $taskCode)
+    : null;
 
 /** Fragment: alleen de parts-modal (zelfde auth), voor openen zonder herladen. */
 if (isset($_GET['partial']) && (string) $_GET['partial'] === '1') {
